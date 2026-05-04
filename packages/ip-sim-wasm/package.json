@@ -1,0 +1,18 @@
+{
+  "name": "@ip-sim/wasm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": [
+    "./pkg/ip_sim_wasm.js",
+    "./pkg/ip_sim_wasm_bg.js"
+  ],
+  "main": "./pkg/ip_sim_wasm.js",
+  "types": "./pkg/ip_sim_wasm.d.ts",
+  "files": [
+    "pkg"
+  ],
+  "scripts": {
+    "build": "wasm-pack build . --target bundler --out-dir pkg"
+  }
+}

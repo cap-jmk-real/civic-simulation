@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0d0d0f;
+  --panel: #141418;
+  --border: #2a2a32;
+  --muted: #8a8f98;
+  --text: #e8e8ed;
+  --accent: #3b82f6;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+.font-mono-n {
+  font-family: var(--mono);
+}

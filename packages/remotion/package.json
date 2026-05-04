@@ -1,0 +1,21 @@
+{
+  "name": "@ip-sim/remotion",
+  "private": true,
+  "scripts": {
+    "preview": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts IpSimMetrics ../../out/ip-sim-metrics.mp4",
+    "render:props": "remotion render src/index.ts IpSimMetrics ../../out/ip-sim-metrics.mp4 --props=./sample-props.json"
+  },
+  "dependencies": {
+    "@ip-sim/core": "workspace:*",
+    "@remotion/cli": "4.0.456",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "remotion": "4.0.456",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.6",
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "_comment": "Cross-language golden for computeMarketShares raw weights. Regenerate expected_raw_weights: node packages/sim-core/scripts/print-market-golden.mjs",
+  "capability_beta": 0.62,
+  "spillover_alpha": 0.35,
+  "type_weights": [1.65, 0.85, 1.05, 0.95],
+  "knowledge": [25, 40, 15, 8],
+  "reputation": [3, 1, 0, -1],
+  "patent_count": [2, 0, 1, 0],
+  "agent_kind": [0, 1, 2, 3],
+  "edges": [
+    [0, 1, 1.0],
+    [0, 2, 0.5],
+    [1, 2, 1.0],
+    [1, 3, 2.0]
+  ],
+  "expected_raw_weights": [
+    24.696558723793498,
+    11.927976397581668,
+    10.76370660030451,
+    8.490923592778104
+  ]
+}

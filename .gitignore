@@ -1,0 +1,15 @@
+node_modules
+dist
+.next
+out
+.env
+.env.local
+*.log
+.DS_Store
+remotion/out
+# Rust
+packages/ip-sim-engine/target
+packages/ip-sim-wasm/target
+
+# Test coverage output
+packages/sim-core/coverage

@@ -1,0 +1,31 @@
+[package]
+name = "ip-sim-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Compiled simulation core for agent-based IP / information-sharing models (Rust)."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "ip_sim_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ip-sim-cli"
+path = "src/main.rs"
+
+[[example]]
+name = "bench_market_150k"
+path = "examples/bench_market_150k.rs"
+required-features = ["parallel"]
+
+[dependencies]
+rayon = { version = "1.10", optional = true }
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
