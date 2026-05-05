@@ -3,15 +3,24 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "env:check": "node ../../scripts/runtime-context.mjs web",
+    "predev": "pnpm env:check && node ../../scripts/setup-native-modules.mjs --guard",
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "pretest": "pnpm env:check",
+    "test": "vitest run",
+    "pretest:watch": "pnpm env:check",
+    "test:watch": "vitest",
+    "presim:worker": "node ../../scripts/setup-native-modules.mjs --guard",
+    "sim:worker": "pnpm --filter @ip-sim/core build && pnpm exec tsx scripts/sim-worker.ts"
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.12",
     "@ip-sim/core": "workspace:*",
     "@ip-sim/wasm": "workspace:*",
+    "better-sqlite3": "^12.9.0",
     "d3-force": "^3.0.0",
     "gifenc": "^1.0.3",
     "next": "^15.1.6",
@@ -22,6 +31,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.0.0",
+    "@types/better-sqlite3": "^7.6.12",
     "@types/d3-force": "^3.0.10",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.6",
@@ -29,6 +39,8 @@
     "eslint": "^9.18.0",
     "eslint-config-next": "^15.1.6",
     "tailwindcss": "^4.0.0",
-    "typescript": "^5.7.2"
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4"
   }
 }

@@ -3,7 +3,7 @@ import { SimulationLab } from "@/components/SimulationLab";
 
 export default function Page() {
   return (
-    <main className="mx-auto max-w-[1600px] p-4 lg:p-6">
+    <main className="mx-auto max-w-[1600px] min-w-0 p-4 lg:p-6">
       <header className="mb-6 flex flex-wrap items-start justify-between gap-3 border-b border-[var(--border)] pb-4">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">

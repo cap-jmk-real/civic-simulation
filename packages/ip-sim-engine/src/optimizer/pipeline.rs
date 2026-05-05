@@ -1,9 +1,18 @@
-//! Heuristic simulation + MSE objective against a terminal metric target.
+//! Heuristic simulation + genetic search against a terminal metric (target MSE or maximize).
 
 use crate::optimizer::genes::{apply_genes_to_config, GeneAxis};
 use crate::optimizer::genetic::{run_genetic_minimize, GeneticConfig, GeneticResult};
 use crate::optimizer::metric::{read_optimization_metric, OptimizationMetric};
 use crate::sim::{run_simulation_sync_heuristic, SimulationRun, SimConfig};
+
+/// How [`run_policy_target_search`] maps the terminal metric to scalar fitness (minimize).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PolicySearchObjective {
+    /// Minimize \((\text{metric} - \text{target})^2\).
+    Target { target: f64 },
+    /// Maximize terminal metric (internally minimize \(-\text{metric}\)).
+    Maximize,
+}
 
 /// Full search: genetic optimization of policy / kernel genes toward a scalar outcome.
 #[derive(Clone, Debug)]
@@ -11,7 +20,7 @@ pub struct PolicySearchParams<'a> {
     pub base: &'a SimConfig,
     pub axes: &'a [GeneAxis],
     pub metric: OptimizationMetric,
-    pub target: f64,
+    pub objective: PolicySearchObjective,
     pub genetic: GeneticConfig,
 }
 
@@ -22,12 +31,12 @@ pub struct PolicySearchResult {
     pub best_run: SimulationRun,
 }
 
-/// Run GA where fitness is MSE between terminal metric and `target` (heuristic policy only).
+/// Run GA over heuristic runs: fitness is MSE to a target or \(-\text{metric}\) when maximizing.
 pub fn run_policy_target_search(params: &PolicySearchParams<'_>) -> PolicySearchResult {
     let base = params.base.clone();
     let axes: Vec<GeneAxis> = params.axes.to_vec();
     let metric = params.metric;
-    let target = params.target;
+    let objective = params.objective;
     let gcfg = params.genetic.clone();
 
     let genetic_res = run_genetic_minimize(&gcfg, axes.len(), |genes| {
@@ -37,7 +46,10 @@ pub fn run_policy_target_search(params: &PolicySearchParams<'_>) -> PolicySearch
         if let Some(rec) = last {
             let v = read_optimization_metric(&rec.metrics, metric);
             if v.is_finite() {
-                (v - target).powi(2)
+                match objective {
+                    PolicySearchObjective::Target { target } => (v - target).powi(2),
+                    PolicySearchObjective::Maximize => -v,
+                }
             } else {
                 1e12
             }
@@ -84,7 +96,7 @@ mod tests {
             base: &short,
             axes: &axes,
             metric: OptimizationMetric::GiniWealth,
-            target: 0.5,
+            objective: PolicySearchObjective::Target { target: 0.5 },
             genetic: gcfg,
         });
 

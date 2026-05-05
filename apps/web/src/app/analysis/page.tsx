@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addBatchToProject,
@@ -13,6 +14,7 @@ import {
 import type { AnalysisBatch, AnalysisProject } from "@/lib/analysisTypes";
 
 export default function AnalysisPage() {
+  const searchParams = useSearchParams();
   const [projects, setProjects] = useState<AnalysisProject[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>("");
   const [selectedBatchId, setSelectedBatchId] = useState<string>("");
@@ -30,6 +32,18 @@ export default function AnalysisPage() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    const pid = searchParams.get("project");
+    const bid = searchParams.get("batch");
+    if (!pid || projects.length === 0) return;
+    const proj = projects.find((p) => p.id === pid);
+    if (!proj) return;
+    setSelectedProjectId(pid);
+    if (bid && proj.batches.some((b) => b.id === bid)) {
+      setSelectedBatchId(bid);
+    }
+  }, [searchParams, projects]);
 
   const selectedProject = useMemo(
     () => projects.find((p) => p.id === selectedProjectId),

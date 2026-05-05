@@ -8,35 +8,34 @@ import {
   meanWealthAtTick,
 } from "@/lib/runOutcomeMetrics";
 import {
-  analysisStoreSchema,
+  migrateAnalysisStore,
+  type AnalysisArtifact,
   type AnalysisBatch,
+  type AnalysisBatchKind,
+  type AnalysisFolder,
   type AnalysisProject,
   type AnalysisStore,
-  type StoredCell,
 } from "@/lib/analysisTypes";
+import type { SimulationRun, WorldState } from "@ip-sim/core";
+import { parseRun } from "@ip-sim/core";
 
 const STORAGE_KEY = "ip-abm-analysis-store-v1";
 
-function newId(): string {
-  return `p_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+function newId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export function loadStore(): AnalysisStore {
   if (typeof window === "undefined") {
-    return { version: 1, projects: [] };
+    return { version: 3, projects: [] };
   }
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { version: 1, projects: [] };
+    if (!raw) return { version: 3, projects: [] };
     const parsed: unknown = JSON.parse(raw);
-    const r = analysisStoreSchema.safeParse(parsed);
-    if (!r.success) {
-      console.warn("analysisStorage: invalid store, resetting", r.error.flatten());
-      return { version: 1, projects: [] };
-    }
-    return r.data;
+    return migrateAnalysisStore(parsed);
   } catch {
-    return { version: 1, projects: [] };
+    return { version: 3, projects: [] };
   }
 }
 
@@ -74,25 +73,73 @@ export function addBatchToProject(projectId: string, batch: AnalysisBatch): void
 export function createProject(name: string): AnalysisProject {
   const now = new Date().toISOString();
   const p: AnalysisProject = {
-    id: newId(),
+    id: newId("p"),
     name: name.trim() || "Untitled project",
     createdAt: now,
     updatedAt: now,
+    folders: [],
+    artifacts: [],
     batches: [],
   };
   upsertProject(p);
   return p;
 }
 
-/** Convert live grid results to a storable batch (no full `history` arrays). */
+export function createFolder(
+  projectId: string,
+  name: string,
+  parentId: string | null = null,
+): AnalysisFolder | null {
+  const s = loadStore();
+  const p = s.projects.find((x) => x.id === projectId);
+  if (!p) return null;
+  const folder: AnalysisFolder = {
+    id: newId("fld"),
+    name: name.trim() || "Folder",
+    parentId,
+    createdAt: new Date().toISOString(),
+  };
+  p.folders = [...p.folders, folder];
+  p.updatedAt = new Date().toISOString();
+  saveStore(s);
+  return folder;
+}
+
+export function addArtifactToProject(projectId: string, artifact: AnalysisArtifact): void {
+  const s = loadStore();
+  const p = s.projects.find((x) => x.id === projectId);
+  if (!p) return;
+  p.artifacts = [...p.artifacts.filter((a) => a.id !== artifact.id), artifact];
+  p.updatedAt = new Date().toISOString();
+  saveStore(s);
+}
+
+/** Optional dated subfolder under `parentId` (or project root when null). */
+export function ensureAutoSubfolder(
+  projectId: string,
+  parentId: string | null,
+  tag: string,
+): string | null {
+  const label = `${tag} · ${new Date().toISOString().slice(0, 10)}`;
+  return createFolder(projectId, label, parentId)?.id ?? null;
+}
+
+/** Convert live grid results to a storable batch (no full `history` arrays on cells). */
 export function gridResultsToBatch(
   name: string,
   results: GridCellResult[],
   constructionMode: string,
   levelProductLabel: string,
+  options?: {
+    id?: string;
+    kind?: AnalysisBatchKind;
+    status?: AnalysisBatch["status"];
+    runRef?: AnalysisBatch["runRef"];
+    folderId?: string | null;
+  },
 ): AnalysisBatch {
   const now = new Date().toISOString();
-  const cells: StoredCell[] = results.map((r) => {
+  const cells = results.map((r) => {
     const last = r.run.history[r.run.history.length - 1];
     const m = last?.metrics;
     const tickCount = r.run.history.length;
@@ -115,21 +162,98 @@ export function gridResultsToBatch(
     };
   });
   return {
-    id: newId(),
+    id: options?.id ?? newId("b"),
     name: name.trim() || `Batch ${now.slice(0, 19)}`,
     createdAt: now,
     constructionMode,
     levelProductLabel,
     cells,
+    kind: options?.kind ?? "grid",
+    status: options?.status ?? "done",
+    runRef: options?.runRef,
+    folderId: options?.folderId ?? null,
   };
+}
+
+/** Persist full run including `finalWorld` so the lab graph preview can reload. */
+export function singleRunToBatch(
+  name: string,
+  run: SimulationRun & { finalWorld?: WorldState },
+  options?: {
+    id?: string;
+    status?: AnalysisBatch["status"];
+    runRef?: AnalysisBatch["runRef"];
+    folderId?: string | null;
+  },
+): AnalysisBatch {
+  const now = new Date().toISOString();
+  return {
+    id: options?.id ?? newId("b"),
+    name: name.trim() || `Run ${now.slice(0, 19)}`,
+    createdAt: now,
+    constructionMode: "single",
+    levelProductLabel: `seed ${run.manifest.seed} · ${run.history.length} ticks`,
+    cells: [],
+    kind: "single",
+    status: options?.status ?? "done",
+    runRef: options?.runRef,
+    folderId: options?.folderId ?? null,
+    fullRunJson: JSON.stringify({
+      manifest: run.manifest,
+      history: run.history,
+      finalWorld: run.finalWorld,
+    }),
+  };
+}
+
+export function createPendingBatch(input: {
+  id?: string;
+  name: string;
+  kind: AnalysisBatchKind;
+  folderId?: string | null;
+  runRef: NonNullable<AnalysisBatch["runRef"]>;
+  status?: AnalysisBatch["status"];
+}): AnalysisBatch {
+  const now = new Date().toISOString();
+  return {
+    id: input.id ?? newId("b"),
+    name: input.name.trim() || `${input.kind} ${now.slice(0, 19)}`,
+    createdAt: now,
+    constructionMode: "pending",
+    levelProductLabel: "pending",
+    cells: [],
+    kind: input.kind,
+    status: input.status ?? "running",
+    runRef: input.runRef,
+    folderId: input.folderId ?? null,
+    fullRunJson: undefined,
+  };
+}
+
+export function reviveStoredSingleRun(json: string): SimulationRun & { finalWorld?: WorldState } {
+  const o = JSON.parse(json) as {
+    manifest: unknown;
+    history: unknown;
+    finalWorld?: WorldState;
+  };
+  const base = parseRun(JSON.stringify({ manifest: o.manifest, history: o.history }));
+  return { ...base, finalWorld: o.finalWorld };
 }
 
 export function buildContextForAgent(project: AnalysisProject, batchId: string): string {
   const batch = project.batches.find((b) => b.id === batchId);
   if (!batch) return "";
+  if (batch.kind === "single") {
+    return [
+      `# Project: ${project.name}`,
+      `Single run: ${batch.name} (${batch.createdAt})`,
+      batch.fullRunJson ? `\`\`\`json\n${batch.fullRunJson.slice(0, 12_000)}${batch.fullRunJson.length > 12_000 ? "\n…(truncated)" : ""}\n\`\`\`` : "",
+      "",
+    ].join("\n");
+  }
   const lines: string[] = [
     `# Project: ${project.name}`,
-    `Batch: ${batch.name} (${batch.createdAt})`,
+    `Batch: ${batch.name} (${batch.createdAt}) · ${batch.kind}`,
     `Construction: ${batch.constructionMode} · levels → ${batch.levelProductLabel}`,
     `Cells: ${batch.cells.length}`,
     "",

@@ -3,7 +3,7 @@
 use ip_sim_engine::sim::default_sim_config;
 use ip_sim_engine::{
     read_optimization_metric, run_policy_target_search, GeneAxis, GeneticConfig, OptimizationMetric,
-    PolicySearchParams,
+    PolicySearchObjective, PolicySearchParams,
 };
 
 #[test]
@@ -24,7 +24,7 @@ fn search_best_config_matches_evaluated_genes() {
         base: &base,
         axes: &axes,
         metric: OptimizationMetric::MeanWealth,
-        target: 1.0,
+        objective: PolicySearchObjective::Target { target: 1.0 },
         genetic: gcfg,
     });
 

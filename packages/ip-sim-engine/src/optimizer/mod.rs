@@ -10,7 +10,9 @@ pub mod genes;
 pub mod metric;
 pub mod pipeline;
 
-pub use genes::{apply_genes_to_config, GeneAxis};
+pub use genes::{apply_genes_to_config, parse_gene_axis_id, GeneAxis};
 pub use genetic::{run_genetic_minimize, GeneticConfig, GeneticResult};
-pub use metric::{read_optimization_metric, OptimizationMetric};
-pub use pipeline::{run_policy_target_search, PolicySearchParams, PolicySearchResult};
+pub use metric::{optimization_metric_from_key, read_optimization_metric, OptimizationMetric};
+pub use pipeline::{
+    run_policy_target_search, PolicySearchObjective, PolicySearchParams, PolicySearchResult,
+};

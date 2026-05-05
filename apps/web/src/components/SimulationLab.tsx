@@ -38,23 +38,128 @@ import {
   meanWealthAtTick,
 } from "@/lib/runOutcomeMetrics";
 import { mergeAgentsWithTickSnapshot } from "@/lib/mergeAgentsAtTick";
+import type { GridConstructionMode } from "@/lib/gridAxes";
 import {
   addBatchToProject,
+  createFolder,
+  createPendingBatch,
   createProject,
+  ensureAutoSubfolder,
   gridResultsToBatch,
   listProjects,
+  reviveStoredSingleRun,
+  singleRunToBatch,
+  upsertProject,
 } from "@/lib/analysisStorage";
-import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import type { AnalysisBatch } from "@/lib/analysisTypes";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { BatchGridPanel, type GridCellResult } from "./BatchGridPanel";
+import { LabJobBanner } from "./LabJobBanner";
+import { SimQueuePanel } from "./SimQueuePanel";
 import { OptimizationPanel } from "./OptimizationPanel";
+import { ProjectSidebar } from "./ProjectSidebar";
 import { ForceGraph } from "./ForceGraph";
 import { GraphEvolutionExport } from "./GraphEvolutionExport";
 import { GraphLegend } from "./GraphLegend";
 import { MetricsCharts } from "./MetricsCharts";
 import { ReplayToolbar } from "./ReplayToolbar";
+import {
+  parseSimJobDetailResponse,
+  parseSimJobsListResponse,
+  type SimJobSummaryDto,
+} from "@/lib/simQueue/parseJobsResponse";
+import { parseQueueLabStreamPayload } from "@/lib/simQueue/parseStreamEvent";
+import {
+  deriveActiveRunHydrationState,
+  type LabSessionHydrationSummary,
+} from "@/lib/simQueue/activeRunHydration";
+import {
+  attachSimJobResultToBatch,
+  shouldFetchSimJobDetailOnSelection,
+  simJobDetailPath,
+} from "@/lib/simQueue/jobProjectLinkage";
+import { queuePollingIntervalMs } from "@/lib/simQueue/pollingCadence";
+import { isLabInteractionActive, shouldClearStaleOverlay } from "@/lib/overlayLockGuard";
 
 type PolicyMode = "heuristic" | "qre" | "llm";
+type LabTab = "single" | "grid" | "optimize" | "queue";
+
+type SidebarRunStatus = "running" | "done" | "failed" | "cancelled";
+
+function mapLabSessionStatus(status: string): SidebarRunStatus {
+  if (status === "running" || status === "queued") return "running";
+  if (status === "cancelled") return "cancelled";
+  return "done";
+}
+
+function mapSimJobStatus(status: string): SidebarRunStatus {
+  if (status === "queued" || status === "running") return "running";
+  if (status === "failed") return "failed";
+  if (status === "cancelled") return "cancelled";
+  return "done";
+}
+
+type LabSessionsListResponse = {
+  sessions?: Array<{
+    id?: string;
+    sessionType?: string;
+    status?: string;
+    createdAt?: string;
+    updatedAt?: string;
+    trialCount?: number;
+    cellCount?: number;
+    meta?: unknown;
+  }>;
+  error?: string;
+};
+
+function normalizeLabSessionsForHydration(json: unknown): LabSessionHydrationSummary[] {
+  if (json == null || typeof json !== "object") return [];
+  const o = json as LabSessionsListResponse;
+  if (!Array.isArray(o.sessions)) return [];
+  return o.sessions
+    .map((s): LabSessionHydrationSummary | null => {
+      if (
+        !s ||
+        typeof s.id !== "string" ||
+        typeof s.sessionType !== "string" ||
+        typeof s.status !== "string" ||
+        typeof s.updatedAt !== "string"
+      ) {
+        return null;
+      }
+      return {
+        id: s.id,
+        sessionType: s.sessionType,
+        status: s.status,
+        createdAt: typeof s.createdAt === "string" ? s.createdAt : undefined,
+        updatedAt: s.updatedAt,
+        trialCount: typeof s.trialCount === "number" ? s.trialCount : 0,
+        cellCount: typeof s.cellCount === "number" ? s.cellCount : 0,
+        meta: s.meta,
+      };
+    })
+    .filter((s): s is LabSessionHydrationSummary => s != null);
+}
+
+function sessionProgressText(session: LabSessionHydrationSummary): string {
+  if (session.sessionType === "optimization") {
+    const m = (session.meta ?? {}) as { populationSize?: unknown; generations?: unknown };
+    const pop = typeof m.populationSize === "number" ? m.populationSize : null;
+    const gens = typeof m.generations === "number" ? m.generations : null;
+    const planned = pop != null && gens != null ? pop * gens : null;
+    if (planned != null && planned > 0) {
+      return `${session.trialCount.toLocaleString("en-US")} / ${planned.toLocaleString("en-US")} trials`;
+    }
+    return `${session.trialCount.toLocaleString("en-US")} trial(s) recorded`;
+  }
+  const gm = (session.meta ?? {}) as { runnableTotal?: unknown; plannedTotalRuns?: unknown };
+  const planned = typeof gm.runnableTotal === "number" ? gm.runnableTotal : typeof gm.plannedTotalRuns === "number" ? gm.plannedTotalRuns : null;
+  if (planned != null && planned > 0) {
+    return `${session.cellCount.toLocaleString("en-US")} / ${planned.toLocaleString("en-US")} cells`;
+  }
+  return `${session.cellCount.toLocaleString("en-US")} cell(s) recorded`;
+}
 
 function repFromSnapshots(h: TickRecord) {
   const vals = h.agentSnapshots.map((a) => a.reputation ?? 0);
@@ -125,8 +230,16 @@ export function SimulationLab() {
   const [exportingVideo, setExportingVideo] = useState(false);
   const [exportingGif, setExportingGif] = useState(false);
   const [compiledKernel, setCompiledKernel] = useState<string | null | undefined>(undefined);
-  const [analysisProjectName, setAnalysisProjectName] = useState("My analyses");
+  const [labTab, setLabTab] = useState<LabTab>("single");
+  const [storeTick, setStoreTick] = useState(0);
+  const [projectsHydrated, setProjectsHydrated] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
+  const [autogenSubfolders, setAutogenSubfolders] = useState(true);
   const [analysisBatchName, setAnalysisBatchName] = useState("");
+  const [singleRunLabel, setSingleRunLabel] = useState("");
+  const [optimizationBatchName, setOptimizationBatchName] = useState("");
+  const [lastOptimizationCells, setLastOptimizationCells] = useState<GridCellResult[] | null>(null);
   const [lastGridBatch, setLastGridBatch] = useState<{
     results: GridCellResult[];
     constructionLabel: string;
@@ -135,6 +248,42 @@ export function SimulationLab() {
   /** Bumps to clear graph node selection (new run or explicit clear). */
   const [graphSelectionVersion, setGraphSelectionVersion] = useState(0);
   const [selectedGraphNodeIds, setSelectedGraphNodeIds] = useState<string[]>([]);
+  const [labJobRunner, setLabJobRunner] = useState({ grid: false, optimization: false });
+  const [enqueueBusy, setEnqueueBusy] = useState(false);
+  const [enqueueNotice, setEnqueueNotice] = useState<string | null>(null);
+  const [activeSingleBatchId, setActiveSingleBatchId] = useState<string | null>(null);
+  const [hydratedQueueJobs, setHydratedQueueJobs] = useState<SimJobSummaryDto[]>([]);
+  const [hydratedLabSessions, setHydratedLabSessions] = useState<LabSessionHydrationSummary[]>([]);
+  const [loadingSingleBatchId, setLoadingSingleBatchId] = useState<string | null>(null);
+  const hasHydrationActiveRunsRef = useRef(false);
+  const prevInteractionActiveRef = useRef(false);
+  const graphMeasureRef = useRef<HTMLDivElement>(null);
+  const [graphBoxWidth, setGraphBoxWidth] = useState(0);
+
+  useEffect(() => {
+    hasHydrationActiveRunsRef.current =
+      hydratedQueueJobs.some((job) => job.status === "queued" || job.status === "running") ||
+      hydratedLabSessions.some((s) => s.status === "running");
+  }, [hydratedLabSessions, hydratedQueueJobs]);
+
+  useLayoutEffect(() => {
+    const el = graphMeasureRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      setGraphBoxWidth(el.getBoundingClientRect().width);
+    });
+    ro.observe(el);
+    setGraphBoxWidth(el.getBoundingClientRect().width);
+    return () => ro.disconnect();
+  }, []);
+
+  const graphDims = useMemo(() => {
+    const w = Math.floor(graphBoxWidth);
+    // Fill measured preview column width (ResizeObserver); keep a sane floor before first layout.
+    const width = w > 0 ? Math.max(240, w) : 400;
+    const height = Math.round((width * 420) / 720);
+    return { width, height };
+  }, [graphBoxWidth]);
 
   useEffect(() => {
     let cancelled = false;
@@ -151,6 +300,101 @@ export function SimulationLab() {
   }, []);
 
   const machineHints = useMachineResourceHints();
+
+  const refreshProjects = useCallback(() => setStoreTick((t) => t + 1), []);
+  useEffect(() => {
+    setProjectsHydrated(true);
+  }, []);
+  const projects = useMemo(
+    () => (projectsHydrated ? listProjects() : []),
+    [projectsHydrated, storeTick],
+  );
+
+  useEffect(() => {
+    if (selectedProjectId != null) return;
+    if (projects.length > 0) setSelectedProjectId(projects[0]!.id);
+  }, [projects, selectedProjectId]);
+
+  const ensureProjectId = useCallback(() => {
+    if (selectedProjectId) return selectedProjectId;
+    const p = createProject("My project");
+    refreshProjects();
+    setSelectedProjectId(p.id);
+    return p.id;
+  }, [selectedProjectId, refreshProjects]);
+
+  const resolveFolderIdForSave = useCallback(
+    (tag: string) => {
+      const pid = ensureProjectId();
+      if (!autogenSubfolders) return activeFolderId;
+      const sub = ensureAutoSubfolder(pid, activeFolderId, tag);
+      refreshProjects();
+      return sub ?? activeFolderId;
+    },
+    [activeFolderId, autogenSubfolders, ensureProjectId, refreshProjects],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    const reconcile = (payload: {
+      jobs?: { id: string; status: string }[];
+      sessions?: { id: string; status: string }[];
+    }) => {
+      if (cancelled || !selectedProjectId) return;
+      const project = listProjects().find((p) => p.id === selectedProjectId);
+      if (!project) return;
+      const jobs = new Map((payload.jobs ?? []).map((j) => [j.id, mapSimJobStatus(j.status)]));
+      const sessions = new Map(
+        (payload.sessions ?? []).map((s) => [s.id, mapLabSessionStatus(s.status)]),
+      );
+      let changed = false;
+      const batches = project.batches.map((b) => {
+        const ref = b.runRef;
+        if (!ref || b.status !== "running") return b;
+        const next =
+          ref.kind === "sim_job" ? jobs.get(ref.id) : ref.kind === "lab_session" ? sessions.get(ref.id) : undefined;
+        if (!next || next === b.status) return b;
+        changed = true;
+        return { ...b, status: next };
+      });
+      if (!changed) return;
+      upsertProject({ ...project, batches, updatedAt: new Date().toISOString() });
+      refreshProjects();
+    };
+
+    const loadOnce = async () => {
+      try {
+        const [jobsRes, sessionsRes] = await Promise.all([
+          fetch("/api/sim/jobs", { cache: "no-store" }),
+          fetch("/api/lab/sessions", { cache: "no-store" }),
+        ]);
+        const jobsJson = (await jobsRes.json()) as { jobs?: { id: string; status: string }[] };
+        const sessionsJson = (await sessionsRes.json()) as {
+          sessions?: { id: string; status: string }[];
+        };
+        reconcile({ jobs: jobsJson.jobs, sessions: sessionsJson.sessions });
+      } catch {
+        /* ignore */
+      }
+    };
+    void loadOnce();
+    const es = new EventSource("/api/sim/stream");
+    es.onmessage = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.data) as {
+          jobs?: { id: string; status: string }[];
+          sessions?: { id: string; status: string }[];
+        };
+        reconcile(parsed);
+      } catch {
+        /* ignore non-json events */
+      }
+    };
+    return () => {
+      cancelled = true;
+      es.close();
+    };
+  }, [refreshProjects, selectedProjectId]);
 
   const effectiveHistory = run?.history ?? [];
   const sliderMax = Math.max(0, effectiveHistory.length - 1);
@@ -182,20 +426,231 @@ export function SimulationLab() {
     return () => window.clearInterval(id);
   }, [playing, playbackTps, run?.history.length]);
 
-  const saveGridToAnalysis = useCallback(() => {
-    if (!lastGridBatch || lastGridBatch.results.length === 0) return;
-    const batch = gridResultsToBatch(
-      analysisBatchName,
-      lastGridBatch.results,
-      lastGridBatch.constructionLabel,
-      lastGridBatch.levelProductLabel,
+  const saveSingleToProject = useCallback(() => {
+    if (!run) return;
+    const pid = ensureProjectId();
+    const folderId = resolveFolderIdForSave("Single");
+    const batch = singleRunToBatch(singleRunLabel, run, { folderId });
+    addBatchToProject(pid, batch);
+    refreshProjects();
+  }, [ensureProjectId, refreshProjects, resolveFolderIdForSave, run, singleRunLabel]);
+
+  const onGridBatchFinished = useCallback(
+    (
+      results: GridCellResult[],
+      meta: {
+        sessionId: string | null;
+        cancelled: boolean;
+        gridConstruction: GridConstructionMode;
+        constructionLabel: string;
+        levelProductLabel: string;
+      },
+    ) => {
+      if (results.length === 0 && !meta.sessionId) return;
+      setLastGridBatch({
+        results,
+        constructionLabel: meta.constructionLabel,
+        levelProductLabel: meta.levelProductLabel,
+      });
+      const pid = ensureProjectId();
+      const folderId = resolveFolderIdForSave("Grid");
+      const batch = gridResultsToBatch(
+        analysisBatchName.trim() || `Grid ${new Date().toISOString().slice(0, 19)}`,
+        results,
+        meta.constructionLabel,
+        meta.levelProductLabel,
+        {
+          id: meta.sessionId ? `lab_${meta.sessionId}` : undefined,
+          kind: "grid",
+          status: meta.cancelled ? "cancelled" : "done",
+          runRef: meta.sessionId ? { kind: "lab_session", id: meta.sessionId } : undefined,
+          folderId,
+        },
+      );
+      addBatchToProject(pid, batch);
+      refreshProjects();
+    },
+    [analysisBatchName, ensureProjectId, refreshProjects, resolveFolderIdForSave],
+  );
+
+  const onOptimizationSessionFinished = useCallback(
+    (cells: GridCellResult[], meta: { sessionId: string | null; cancelled: boolean }) => {
+      setLastOptimizationCells(cells.length > 0 ? cells : null);
+      if (cells.length === 0 && !meta.sessionId) return;
+      const pid = ensureProjectId();
+      const folderId = resolveFolderIdForSave("Optimize");
+      const batch = gridResultsToBatch(
+        optimizationBatchName.trim() || `Optimization ${new Date().toISOString().slice(0, 19)}`,
+        cells,
+        "Genetic search",
+        `${cells.length} trials`,
+        {
+          id: meta.sessionId ? `lab_${meta.sessionId}` : undefined,
+          kind: "optimization",
+          status: meta.cancelled ? "cancelled" : "done",
+          runRef: meta.sessionId ? { kind: "lab_session", id: meta.sessionId } : undefined,
+          folderId,
+        },
+      );
+      addBatchToProject(pid, batch);
+      refreshProjects();
+    },
+    [ensureProjectId, optimizationBatchName, refreshProjects, resolveFolderIdForSave],
+  );
+
+  const onGridSessionStarted = useCallback(
+    (meta: {
+      sessionId: string;
+      gridConstruction: GridConstructionMode;
+      constructionLabel: string;
+      levelProductLabel: string;
+    }) => {
+      const pid = ensureProjectId();
+      const folderId = resolveFolderIdForSave("Grid");
+      addBatchToProject(
+        pid,
+        createPendingBatch({
+          id: `lab_${meta.sessionId}`,
+          name: analysisBatchName.trim() || `Grid ${new Date().toISOString().slice(0, 19)}`,
+          kind: "grid",
+          folderId,
+          runRef: { kind: "lab_session", id: meta.sessionId },
+        }),
+      );
+      refreshProjects();
+    },
+    [analysisBatchName, ensureProjectId, refreshProjects, resolveFolderIdForSave],
+  );
+
+  const onOptimizationSessionStarted = useCallback(
+    (meta: { sessionId: string }) => {
+      const pid = ensureProjectId();
+      const folderId = resolveFolderIdForSave("Optimize");
+      addBatchToProject(
+        pid,
+        createPendingBatch({
+          id: `lab_${meta.sessionId}`,
+          name: optimizationBatchName.trim() || `Optimization ${new Date().toISOString().slice(0, 19)}`,
+          kind: "optimization",
+          folderId,
+          runRef: { kind: "lab_session", id: meta.sessionId },
+        }),
+      );
+      refreshProjects();
+    },
+    [ensureProjectId, optimizationBatchName, refreshProjects, resolveFolderIdForSave],
+  );
+
+  const exportLastGridBatchJson = useCallback(() => {
+    if (!lastGridBatch?.results.length) return;
+    const blob = new Blob(
+      [
+        JSON.stringify(
+          {
+            kind: "grid_batch_export",
+            exportedAt: new Date().toISOString(),
+            constructionLabel: lastGridBatch.constructionLabel,
+            levelProductLabel: lastGridBatch.levelProductLabel,
+            cells: lastGridBatch.results.map((r) => ({
+              id: r.id,
+              label: r.label,
+              assignments: r.assignments,
+              run: { manifest: r.run.manifest, history: r.run.history, finalWorld: r.run.finalWorld },
+            })),
+          },
+          null,
+          2,
+        ),
+      ],
+      { type: "application/json" },
     );
-    const name = analysisProjectName.trim() || "My analyses";
-    const projects = listProjects();
-    const existing = projects.find((p) => p.name === name);
-    const project = existing ?? createProject(name);
-    addBatchToProject(project.id, batch);
-  }, [analysisBatchName, analysisProjectName, lastGridBatch]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ip-abm-grid-batch-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [lastGridBatch]);
+
+  const exportLastOptimizationJson = useCallback(() => {
+    if (!lastOptimizationCells?.length) return;
+    const blob = new Blob(
+      [
+        JSON.stringify(
+          {
+            kind: "optimization_export",
+            exportedAt: new Date().toISOString(),
+            trials: lastOptimizationCells.map((r) => ({
+              id: r.id,
+              label: r.label,
+              assignments: r.assignments,
+              run: { manifest: r.run.manifest, history: r.run.history, finalWorld: r.run.finalWorld },
+            })),
+          },
+          null,
+          2,
+        ),
+      ],
+      { type: "application/json" },
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ip-abm-optimization-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [lastOptimizationCells]);
+
+  const loadStoredSingleBatch = useCallback(
+    async (batch: AnalysisBatch) => {
+      if (batch.kind !== "single") return;
+      setLoadingSingleBatchId(batch.id);
+      try {
+        let selected = batch;
+        if (shouldFetchSimJobDetailOnSelection(selected) && selected.runRef?.kind === "sim_job") {
+          const detailRes = await fetch(simJobDetailPath(selected.runRef.id), { cache: "no-store" });
+          const parsed = parseSimJobDetailResponse(await detailRes.json());
+          if (!detailRes.ok || parsed.error || !parsed.detail || parsed.detail.status !== "done") {
+            throw new Error(parsed.error ?? detailRes.statusText);
+          }
+          if (typeof parsed.detail.result_json !== "string" || parsed.detail.result_json.length === 0) {
+            throw new Error("Selected run has no persisted result payload.");
+          }
+          const hydrated = attachSimJobResultToBatch(selected, parsed.detail.result_json);
+          if (!hydrated?.fullRunJson) {
+            throw new Error("Selected run payload is not a replayable simulation run.");
+          }
+          selected = hydrated;
+          const project = listProjects().find((p) => p.id === selectedProjectId);
+          if (project) {
+            const nextBatches = project.batches.map((b) => (b.id === selected.id ? selected : b));
+            upsertProject({ ...project, batches: nextBatches, updatedAt: new Date().toISOString() });
+            refreshProjects();
+          }
+        }
+        if (!selected.fullRunJson) {
+          throw new Error("Selected run payload is not available yet.");
+        }
+        const revived = reviveStoredSingleRun(selected.fullRunJson);
+        setPlaying(false);
+        setCompareRun(null);
+        setGraphSelectionVersion((v) => v + 1);
+        setRun(revived);
+        setTickIndex(revived.history.length - 1);
+        const next = revived.manifest.config;
+        setConfig(next);
+        const n = totalAgents(next.agentCounts);
+        setPopulationPlannedTotal(n);
+        setPopulationPctTenths(countsToPctTenths(next.agentCounts));
+        setPopulationPctDirty(freshPopulationPctDirty());
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setLoadingSingleBatchId((prev) => (prev === batch.id ? null : prev));
+      }
+    },
+    [refreshProjects, selectedProjectId],
+  );
 
   const loadGridCell = useCallback((cell: GridCellResult) => {
     setPlaying(false);
@@ -257,6 +712,18 @@ export function SimulationLab() {
   const runSync = useCallback(async () => {
     setError(null);
     setRunning(true);
+    const pid = ensureProjectId();
+    const pendingSingle = createPendingBatch({
+      id: activeSingleBatchId ?? undefined,
+      name: singleRunLabel.trim() || `Run ${new Date().toISOString().slice(0, 19)}`,
+      kind: "single",
+      runRef: { kind: "sim_job", id: `local_${Date.now()}` },
+      status: "running",
+      folderId: activeFolderId,
+    });
+    setActiveSingleBatchId(pendingSingle.id);
+    addBatchToProject(pid, pendingSingle);
+    refreshProjects();
     try {
       const manifestBase = {
         seed: config.seed,
@@ -286,17 +753,49 @@ export function SimulationLab() {
         setGraphSelectionVersion((v) => v + 1);
         setRun(result);
         setTickIndex(result.history.length - 1);
+        const doneBatch = singleRunToBatch(singleRunLabel, result, {
+          id: pendingSingle.id,
+          status: "done",
+          runRef: pendingSingle.runRef,
+          folderId: pendingSingle.folderId,
+        });
+        addBatchToProject(pid, doneBatch);
+        refreshProjects();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      addBatchToProject(pid, { ...pendingSingle, status: "failed" });
+      refreshProjects();
     } finally {
       setRunning(false);
     }
-  }, [config, mode, qreTemp, run]);
+  }, [
+    activeFolderId,
+    activeSingleBatchId,
+    config,
+    ensureProjectId,
+    mode,
+    qreTemp,
+    refreshProjects,
+    run,
+    singleRunLabel,
+  ]);
 
   const runLlm = useCallback(async () => {
     setError(null);
     setRunning(true);
+    const pid = ensureProjectId();
+    const pendingSingle = createPendingBatch({
+      id: activeSingleBatchId ?? undefined,
+      name: singleRunLabel.trim() || `Run ${new Date().toISOString().slice(0, 19)}`,
+      kind: "single",
+      runRef: { kind: "sim_job", id: `local_${Date.now()}` },
+      status: "running",
+      folderId: activeFolderId,
+    });
+    setActiveSingleBatchId(pendingSingle.id);
+    addBatchToProject(pid, pendingSingle);
+    refreshProjects();
     try {
       const result = await runSimulationAsync({
         config,
@@ -330,17 +829,171 @@ export function SimulationLab() {
       setGraphSelectionVersion((v) => v + 1);
       setRun(result);
       setTickIndex(result.history.length - 1);
+      const doneBatch = singleRunToBatch(singleRunLabel, result, {
+        id: pendingSingle.id,
+        status: "done",
+        runRef: pendingSingle.runRef,
+        folderId: pendingSingle.folderId,
+      });
+      addBatchToProject(pid, doneBatch);
+      refreshProjects();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      addBatchToProject(pid, { ...pendingSingle, status: "failed" });
+      refreshProjects();
     } finally {
       setRunning(false);
     }
-  }, [config, run]);
+  }, [
+    activeFolderId,
+    activeSingleBatchId,
+    config,
+    ensureProjectId,
+    refreshProjects,
+    run,
+    singleRunLabel,
+  ]);
 
   const onRun = () => {
     if (mode === "llm") void runLlm();
     else void runSync();
   };
+
+  const onEnqueueRun = useCallback(async () => {
+    setEnqueueNotice(null);
+    if (mode === "llm") {
+      setError("Queued runs support heuristic and QRE only — switch policy or use Run for LLM.");
+      return;
+    }
+    setEnqueueBusy(true);
+    try {
+      const pid = ensureProjectId();
+      const folderId = resolveFolderIdForSave("Queue");
+      const policyMode = mode === "heuristic" ? "heuristic" : "qre";
+      const res = await fetch("/api/sim/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          config,
+          policyMode,
+          qreTemp: policyMode === "qre" ? qreTemp : undefined,
+        }),
+      });
+      const j = (await res.json()) as { id?: string; error?: string };
+      if (!res.ok) throw new Error(j.error ?? res.statusText);
+      if (j.id) {
+        addBatchToProject(
+          pid,
+          createPendingBatch({
+            id: `job_${j.id}`,
+            name: `Queued run ${j.id.slice(0, 8)}`,
+            kind: "single",
+            folderId,
+            runRef: { kind: "sim_job", id: j.id },
+          }),
+        );
+        refreshProjects();
+      }
+      setEnqueueNotice(`Queued job ${j.id?.slice(0, 8) ?? ""}… — open Queue tab and run pnpm sim:worker locally.`);
+      setLabTab("queue");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEnqueueBusy(false);
+    }
+  }, [config, ensureProjectId, mode, qreTemp, refreshProjects, resolveFolderIdForSave]);
+
+  const onGridLabJobRunner = useCallback((active: boolean) => {
+    setLabJobRunner((r) => ({ ...r, grid: active }));
+  }, []);
+  const onOptimizationLabJobRunner = useCallback((active: boolean) => {
+    setLabJobRunner((r) => ({ ...r, optimization: active }));
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    let sseConnected = false;
+    let timer: number | null = null;
+    const refreshHydration = async () => {
+      try {
+        const [jobsRes, sessionsRes] = await Promise.all([
+          fetch("/api/sim/jobs", { cache: "no-store" }),
+          fetch("/api/lab/sessions", { cache: "no-store" }),
+        ]);
+        const jobsParsed = parseSimJobsListResponse(await jobsRes.json());
+        if (jobsRes.ok && !jobsParsed.error && alive) {
+          setHydratedQueueJobs(jobsParsed.jobs);
+        }
+        const sessionsParsed = normalizeLabSessionsForHydration(await sessionsRes.json());
+        if (sessionsRes.ok && alive) {
+          setHydratedLabSessions(sessionsParsed);
+        }
+      } catch {
+        /* Keep existing hydration state on transient API errors. */
+      }
+    };
+    void refreshHydration();
+    const es = new EventSource("/api/sim/stream");
+    es.onopen = () => {
+      sseConnected = true;
+    };
+    es.onerror = () => {
+      sseConnected = false;
+    };
+    es.onmessage = (ev) => {
+      const parsed = parseQueueLabStreamPayload(ev.data);
+      if (!parsed.ok) return;
+      if (!alive) return;
+      setHydratedQueueJobs(parsed.data.jobs);
+      setHydratedLabSessions((prev) =>
+        parsed.data.sessions.map((s) => {
+          const existing = prev.find((p) => p.id === s.id);
+          return {
+            ...s,
+            meta: existing?.meta,
+          };
+        }),
+      );
+    };
+    const scheduleRefresh = () => {
+      if (!alive) return;
+      const tabVisible = typeof document === "undefined" ? true : document.visibilityState === "visible";
+      const delay = queuePollingIntervalMs({
+        sseConnected,
+        hasActiveRuns: hasHydrationActiveRunsRef.current,
+        tabVisible,
+      });
+      timer = window.setTimeout(async () => {
+        await refreshHydration();
+        scheduleRefresh();
+      }, delay);
+    };
+    scheduleRefresh();
+    return () => {
+      alive = false;
+      es.close();
+      if (timer != null) window.clearTimeout(timer);
+    };
+  }, []);
+
+  const hydratedActive = useMemo(
+    () => deriveActiveRunHydrationState({ jobs: hydratedQueueJobs, sessions: hydratedLabSessions }),
+    [hydratedLabSessions, hydratedQueueJobs],
+  );
+
+  useEffect(() => {
+    const nextActive = isLabInteractionActive({
+      running,
+      enqueueBusy,
+      gridRunnerActive: labJobRunner.grid,
+      optimizationRunnerActive: labJobRunner.optimization,
+    });
+    const prevActive = prevInteractionActiveRef.current;
+    if (shouldClearStaleOverlay(prevActive, nextActive)) {
+      window.dispatchEvent(new CustomEvent("ip-lab:clear-stale-overlay"));
+    }
+    prevInteractionActiveRef.current = nextActive;
+  }, [enqueueBusy, labJobRunner.grid, labJobRunner.optimization, running]);
 
   const downloadJson = () => {
     if (!run) return;
@@ -357,8 +1010,96 @@ export function SimulationLab() {
   };
 
   return (
-    <div className="grid min-w-0 gap-4 lg:grid-cols-[320px_1fr_340px]">
-      <aside className="min-w-0 space-y-3 rounded-lg border border-[var(--border)] bg-[var(--panel)] p-3">
+    <div className="flex min-h-[100dvh] w-full min-w-0 flex-row items-start gap-2 md:gap-3">
+      <ProjectSidebar
+        projects={projects}
+        selectedProjectId={selectedProjectId}
+        onSelectProject={setSelectedProjectId}
+        onCreateProject={(name) => {
+          const p = createProject(name);
+          refreshProjects();
+          setSelectedProjectId(p.id);
+        }}
+        activeFolderId={activeFolderId}
+        onSelectFolder={setActiveFolderId}
+        autogenSubfolders={autogenSubfolders}
+        onAutogenChange={setAutogenSubfolders}
+        onCreateFolder={(parentId, name) => {
+          if (!selectedProjectId) return;
+          createFolder(selectedProjectId, name, parentId);
+          refreshProjects();
+        }}
+        onLoadSingleBatch={loadStoredSingleBatch}
+        loadingSingleBatchId={loadingSingleBatchId}
+      />
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 lg:flex-row lg:items-start">
+        <div className="flex min-h-[min(92vh,880px)] min-w-0 w-full flex-1 flex-col gap-2 lg:min-h-0 lg:basis-0 lg:shrink lg:grow-[0.9]">
+        <div className="flex shrink-0 flex-wrap gap-1 border-b border-[var(--border)] pb-1" role="tablist">
+          {(["single", "grid", "optimize", "queue"] as const).map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              role="tab"
+              aria-selected={labTab === tab}
+              className={`rounded px-3 py-1.5 text-xs font-medium ${
+                labTab === tab ? "bg-[#1f1f26] text-[var(--text)]" : "text-[var(--muted)] hover:bg-[#141418]"
+              }`}
+              onClick={() => setLabTab(tab)}
+            >
+              {tab === "single"
+                ? "Single run"
+                : tab === "grid"
+                  ? "Grid"
+                  : tab === "optimize"
+                    ? "Optimize"
+                    : "Queue"}
+            </button>
+          ))}
+        </div>
+        <LabJobBanner
+          labTab={labTab}
+          gridRunnerActive={labJobRunner.grid}
+          optimizationRunnerActive={labJobRunner.optimization}
+          onRequestTab={setLabTab}
+        />
+        {error ? (
+          <p className="shrink-0 rounded border border-red-900/60 bg-red-950/40 p-2 text-xs text-red-200">{error}</p>
+        ) : null}
+        {enqueueNotice ? (
+          <p className="shrink-0 rounded border border-emerald-900/50 bg-emerald-950/35 p-2 text-xs text-emerald-100">
+            {enqueueNotice}
+          </p>
+        ) : null}
+        <div
+          className={`min-w-0 rounded-lg border border-[var(--border)] bg-[var(--panel)] lg:min-h-0 lg:max-h-[min(92vh,880px)] lg:overflow-y-auto lg:overscroll-contain ${
+            labTab === "optimize" ? "p-2 lg:p-2" : "p-3"
+          }`}
+        >
+          {labTab === "single" ? (
+            <div className="min-w-0 space-y-2">
+        {hydratedActive.singleJob ? (
+          <div className="rounded-md border border-sky-900/45 bg-sky-950/25 px-2.5 py-1.5 text-[11px] text-sky-100">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span>
+                <span className="font-medium">Currently running in queue</span>
+                <span className="text-sky-200/85">
+                  {" "}
+                  · {hydratedActive.singleJob.status} · {hydratedActive.singleJob.id.slice(0, 8)}…
+                </span>
+              </span>
+              <button
+                type="button"
+                className="rounded border border-sky-800/60 px-2 py-0.5 text-[10px] text-sky-50 hover:bg-sky-950/60"
+                onClick={() => setLabTab("queue")}
+              >
+                Open Queue
+              </button>
+            </div>
+            {hydratedActive.singleJob.progress_note ? (
+              <p className="mt-0.5 text-[10px] text-sky-200/80">{hydratedActive.singleJob.progress_note}</p>
+            ) : null}
+          </div>
+        ) : null}
         <h2 className="flex items-center gap-1 text-sm font-medium">
           Run configuration
           <ParamHelp text="All controls here define a single experiment design: population, IP policy, regulation, innovation costs, and how agents decide actions. Changing values does not auto-run until you press Run." />
@@ -414,65 +1155,67 @@ export function SimulationLab() {
                 }}
               />
             </div>
-            <p className="flex min-w-0 items-baseline font-mono-n text-[10px] leading-tight text-[var(--muted)] sm:col-span-2">
+            <p className="flex min-w-0 items-baseline font-mono-n text-[10px] leading-tight text-[var(--muted)]">
               <span className="min-w-0 break-words">
                 bigco {config.agentCounts.bigco} · acad {config.agentCounts.academic} · smb{" "}
                 {config.agentCounts.smb} · solo {config.agentCounts.solo} · Σ{" "}
                 {totalAgents(config.agentCounts)}
               </span>
             </p>
-            {(["bigco", "academic", "smb", "solo"] as const).map((t) => (
-              <div key={t} className="min-w-0">
-                <label className="text-xs capitalize text-[var(--muted)]">
-                  <FieldLabel
-                    help={
-                      t === "bigco"
-                        ? "Large firms: higher baseline labor and knowledge; stronger weight in competitive demand unless offset by policy."
-                        : t === "academic"
-                          ? "Universities/labs: labor tilt toward services in production; receive open-science stipends tied to subsidy."
-                          : t === "smb"
-                            ? "SMBs: medium endowments; same action set with type-specific starting stocks and CES labor split."
-                            : "Solo entrepreneurs: smallest teams; participate in the same market and network mechanisms with lighter endowments."
-                    }
-                  >
-                    {t} %
-                    {populationPctDirty[t] ? (
-                      <span className="ml-0.5 text-[10px] font-normal normal-case text-[var(--muted)]">
-                        (edited)
-                      </span>
-                    ) : null}
-                  </FieldLabel>
-                </label>
-                <input
-                  type="number"
-                  min={0}
-                  max={100}
-                  step={0.1}
-                  aria-label={`${t} mix percent`}
-                  className="mt-1 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1.5 font-mono-n text-sm"
-                  value={tenthsToPercentage(populationPctTenths[t])}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    const raw = Number.isFinite(v) ? percentageToTenths(v) : 0;
-                    const { tenths, dirty } = rebalancePctTenthsAfterFieldEdit({
-                      current: populationPctTenths,
-                      dirty: populationPctDirty,
-                      editedKey: t,
-                      newTenthsRaw: raw,
-                    });
-                    setPopulationPctTenths(tenths);
-                    setPopulationPctDirty(dirty);
-                    setConfig((c) => ({
-                      ...c,
-                      agentCounts: pctTenthsToAgentCounts(tenths, populationPlannedTotal),
-                    }));
-                  }}
-                />
-                <div className="mt-0.5 font-mono-n text-[10px] text-[var(--muted)]">
-                  → {config.agentCounts[t]}
+            <div className="grid min-w-0 grid-cols-2 gap-2 sm:col-span-2">
+              {(["bigco", "academic", "smb", "solo"] as const).map((t) => (
+                <div key={t} className="min-w-0">
+                  <label className="text-xs capitalize text-[var(--muted)]">
+                    <FieldLabel
+                      help={
+                        t === "bigco"
+                          ? "Large firms: higher baseline labor and knowledge; stronger weight in competitive demand unless offset by policy."
+                          : t === "academic"
+                            ? "Universities/labs: labor tilt toward services in production; receive open-science stipends tied to subsidy."
+                            : t === "smb"
+                              ? "SMBs: medium endowments; same action set with type-specific starting stocks and CES labor split."
+                              : "Solo entrepreneurs: smallest teams; participate in the same market and network mechanisms with lighter endowments."
+                      }
+                    >
+                      {t} %
+                      {populationPctDirty[t] ? (
+                        <span className="ml-0.5 text-[10px] font-normal normal-case text-[var(--muted)]">
+                          (edited)
+                        </span>
+                      ) : null}
+                    </FieldLabel>
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={0.1}
+                    aria-label={`${t} mix percent`}
+                    className="mt-1 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1.5 font-mono-n text-sm"
+                    value={tenthsToPercentage(populationPctTenths[t])}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      const raw = Number.isFinite(v) ? percentageToTenths(v) : 0;
+                      const { tenths, dirty } = rebalancePctTenthsAfterFieldEdit({
+                        current: populationPctTenths,
+                        dirty: populationPctDirty,
+                        editedKey: t,
+                        newTenthsRaw: raw,
+                      });
+                      setPopulationPctTenths(tenths);
+                      setPopulationPctDirty(dirty);
+                      setConfig((c) => ({
+                        ...c,
+                        agentCounts: pctTenthsToAgentCounts(tenths, populationPlannedTotal),
+                      }));
+                    }}
+                  />
+                  <div className="mt-0.5 font-mono-n text-[10px] text-[var(--muted)]">
+                    → {config.agentCounts[t]}
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
         </section>
 
@@ -570,7 +1313,7 @@ export function SimulationLab() {
                 }
               />
             </div>
-            <div className="min-w-0 sm:col-span-2">
+            <div className="min-w-0">
               <label className="block text-xs text-[var(--muted)]">
                 <FieldLabel help="Scales the strength/cost of IP enforcement actions (litigation-style transfers when overlapping patents exist). Higher values intensify deterrence and dispute spending in the model.">
                   Enforcement
@@ -579,7 +1322,7 @@ export function SimulationLab() {
               <input
                 type="range"
                 aria-label="Enforcement intensity"
-                className="mt-1 w-full"
+                className="mt-1 w-full min-w-0"
                 min={0}
                 max={1}
                 step={0.05}
@@ -595,7 +1338,7 @@ export function SimulationLab() {
                 {config.policy.enforcementIntensity.toFixed(2)}
               </div>
             </div>
-            <div className="min-w-0 sm:col-span-2">
+            <div className="min-w-0">
               <label className="block text-xs text-[var(--muted)]">
                 <FieldLabel help="Public support that lowers the wealth cost of open publication and magnifies knowledge spillovers into the global pool (policy lever for disclosure vs secrecy).">
                   Open science subsidy
@@ -604,7 +1347,7 @@ export function SimulationLab() {
               <input
                 type="range"
                 aria-label="Open science subsidy"
-                className="mt-1 w-full"
+                className="mt-1 w-full min-w-0"
                 min={0}
                 max={1}
                 step={0.05}
@@ -626,7 +1369,7 @@ export function SimulationLab() {
               <input
                 type="range"
                 aria-label="Data-sharing mandate strength"
-                className="mt-1 w-full"
+                className="mt-1 w-full min-w-0"
                 min={0}
                 max={1}
                 step={0.05}
@@ -668,7 +1411,7 @@ export function SimulationLab() {
                 <ParamHelp text="Turns on the externality module: offerings contribute channel-specific social costs/benefits that regulators can tax or repair relative to an evolving stringency target." />
               </span>
             </label>
-            <div className="min-w-0 sm:col-span-2">
+            <div className="min-w-0">
               <label className="block text-xs text-[var(--muted)]">
                 <FieldLabel help="Fixed: stringency tracks ambition each tick without persistence. Dynamic: stringency follows a mean-reverting process with noise—rules drift and respond gradually like evolving standards.">
                   Rule dynamics
@@ -692,7 +1435,7 @@ export function SimulationLab() {
                 <option value="dynamic">Dynamic</option>
               </select>
             </div>
-            <div className="min-w-0 sm:col-span-2">
+            <div className="min-w-0">
               <label className="block text-xs text-[var(--muted)]">
                 <FieldLabel help="Desired baseline strictness of mitigation (feeds effective stringency together with scale and corruption). Higher ambition pushes faster reduction of aggregated net harm when regulation is enabled.">
                   Reg. ambition
@@ -701,7 +1444,7 @@ export function SimulationLab() {
               <input
                 type="range"
                 aria-label="Regulatory ambition"
-                className="mt-1 w-full"
+                className="mt-1 w-full min-w-0"
                 min={0}
                 max={1}
                 step={0.05}
@@ -745,8 +1488,8 @@ export function SimulationLab() {
             Governance
             <ParamHelp text="Optional civic roles on top of economic types. Each election period: demote politicians, trim/hire fire-at-will servants, tenure promotions, then fill legislative seats by reputation (plus noise). Tenured servants skip firing. Off by default; when on, role counts appear in tick metrics / JSON export, and the graph uses civic fills (economic type as outlines) when any agent holds office." />
           </h3>
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            <label className="flex cursor-pointer items-start gap-2 text-xs text-[var(--muted)] sm:col-span-2">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            <label className="flex cursor-pointer items-start gap-2 text-xs text-[var(--muted)] sm:col-span-2 lg:col-span-4">
               <input
                 type="checkbox"
                 className="mt-0.5 shrink-0 rounded border-[var(--border)]"
@@ -909,7 +1652,7 @@ export function SimulationLab() {
             Innovation &amp; decay
             <ParamHelp text="Innovation parameters shape how expensive and delayed knowledge creation is; depreciation rates model obsolescence and forgetting between ticks." />
           </h3>
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
             <div className="min-w-0">
               <label className="block text-xs text-[var(--muted)]">
                 <FieldLabel help="Fixed wealth spent before stochastic and knowledge-linked components when an agent chooses invest-in-R&amp;D—baseline difficulty of research projects.">
@@ -990,7 +1733,7 @@ export function SimulationLab() {
                 }
               />
             </div>
-            <div className="min-w-0 sm:col-span-2">
+            <div className="min-w-0 lg:col-span-2">
               <label className="block text-xs text-[var(--muted)]">
                 <FieldLabel help="Multiplicative decay of wealth each tick (maintenance, consumption, capital loss). Higher values erode cash balances faster between market rounds.">
                   Wealth depreciation / tick
@@ -999,7 +1742,7 @@ export function SimulationLab() {
               <input
                 type="range"
                 aria-label="Wealth depreciation rate"
-                className="mt-1 w-full"
+                className="mt-1 w-full min-w-0"
                 min={0}
                 max={0.2}
                 step={0.005}
@@ -1015,7 +1758,7 @@ export function SimulationLab() {
                 {config.wealthDepreciationRate.toFixed(3)}
               </div>
             </div>
-            <div className="min-w-0 sm:col-span-2">
+            <div className="min-w-0 lg:col-span-2">
               <label className="block text-xs text-[var(--muted)]">
                 <FieldLabel help="Knowledge stock lost to obsolescence or forgetting each tick. Higher values make proprietary know-how decay unless continuously replenished.">
                   Knowledge depreciation / tick
@@ -1024,7 +1767,7 @@ export function SimulationLab() {
               <input
                 type="range"
                 aria-label="Knowledge depreciation rate"
-                className="mt-1 w-full"
+                className="mt-1 w-full min-w-0"
                 min={0}
                 max={0.2}
                 step={0.005}
@@ -1049,7 +1792,7 @@ export function SimulationLab() {
             <ParamHelp text="How agents choose actions: fast hand-tuned rules (heuristic), quantal-response equilibrium sampling from softmax utilities (QRE), or API-backed LLM decisions (slow, requires server). QRE temperature: low concentrates on best actions; high adds randomization (exploration vs exploitation)." />
           </h3>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            <div className="min-w-0 sm:col-span-2">
+            <div className={`min-w-0 ${mode === "qre" ? "" : "sm:col-span-2"}`}>
               <label className="block text-xs text-[var(--muted)]">
                 <FieldLabel help="How agents choose actions: fast hand-tuned rules (heuristic), quantal-response equilibrium sampling from softmax utilities (QRE), or API-backed LLM decisions (slow, requires server).">
                   Policy mode
@@ -1067,7 +1810,7 @@ export function SimulationLab() {
               </select>
             </div>
             {mode === "qre" && (
-              <div className="min-w-0 sm:col-span-2">
+              <div className="min-w-0">
                 <label className="block text-xs text-[var(--muted)]">
                   <FieldLabel help="Softmax temperature in QRE: low values concentrate probability on the highest-utility actions (more “rational”); high values randomize more—exploration vs exploitation in discrete choice.">
                     QRE temperature
@@ -1076,7 +1819,7 @@ export function SimulationLab() {
                 <input
                   type="range"
                   aria-label="QRE temperature"
-                  className="mt-1 w-full"
+                  className="mt-1 w-full min-w-0"
                   min={0.1}
                   max={2}
                   step={0.05}
@@ -1089,75 +1832,127 @@ export function SimulationLab() {
           </div>
         </section>
 
-        <div className="mt-2 flex w-full items-center gap-1">
-          <button
-            type="button"
-            disabled={running}
-            onClick={onRun}
-            className="min-w-0 flex-1 rounded-md bg-[var(--accent)] px-3 py-2 text-sm font-medium text-white hover:opacity-95 disabled:opacity-50"
-          >
-            {running ? "Running…" : "Run simulation"}
-          </button>
-          <ParamHelp text="Executes the configured ticks with the selected decision rule (heuristic, QRE, or LLM). Produces the history used by charts, tables, and replay—deterministic for heuristic/QRE at fixed seed." />
+        <div className="mt-2 grid w-full grid-cols-1 gap-2 sm:grid-cols-2 sm:items-start">
+          <div className="flex min-w-0 flex-col gap-1">
+            <div className="flex min-w-0 items-center gap-1">
+              <button
+                type="button"
+                disabled={running}
+                aria-busy={running}
+                onClick={onRun}
+                className="min-w-0 flex-1 rounded-md bg-[var(--accent)] px-3 py-2 text-sm font-medium text-white hover:opacity-95 disabled:opacity-50"
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  {running ? (
+                    <span
+                      className="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent"
+                      aria-hidden="true"
+                    />
+                  ) : null}
+                  <span>{running ? "Running…" : "Run simulation"}</span>
+                </span>
+              </button>
+              <ParamHelp text="Executes the configured ticks with the selected decision rule (heuristic, QRE, or LLM). Produces the history used by charts, tables, and replay—deterministic for heuristic/QRE at fixed seed." />
+            </div>
+            <div className="flex min-w-0 items-center gap-1">
+              <button
+                type="button"
+                disabled={running || enqueueBusy || mode === "llm"}
+                aria-busy={enqueueBusy}
+                onClick={() => void onEnqueueRun()}
+                className="min-w-0 flex-1 rounded-md border border-[var(--border)] px-3 py-2 text-sm hover:bg-[#1a1a1f] disabled:opacity-40"
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  {enqueueBusy ? (
+                    <span
+                      className="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent"
+                      aria-hidden="true"
+                    />
+                  ) : null}
+                  <span>{enqueueBusy ? "Enqueueing…" : "Enqueue run"}</span>
+                </span>
+              </button>
+              <ParamHelp text="Adds a single-run job to the local SQLite queue (heuristic or QRE). Requires a separate Node worker (pnpm sim:worker). Browser WASM heuristic is not used in the worker — runs use TypeScript @ip-sim/core policies." />
+            </div>
+          </div>
+          <div className="flex min-w-0 items-center gap-1">
+            <button
+              type="button"
+              disabled={!run}
+              onClick={downloadJson}
+              className="min-w-0 flex-1 rounded-md border border-[var(--border)] px-3 py-2 text-sm hover:bg-[#1a1a1f] disabled:opacity-40"
+            >
+              Download run JSON
+            </button>
+            <ParamHelp text="Exports the full serialized run (manifest, per-tick metrics, snapshots) for offline analysis or sharing—lossless relative to what the UI consumed." />
+          </div>
         </div>
 
-        <div className="flex w-full items-center gap-1">
+        <div className="mt-2 grid grid-cols-1 gap-2 border-t border-[var(--border)] pt-2 sm:grid-cols-[1fr_auto] sm:items-end">
+          <label className="min-w-0 text-[10px] text-[var(--muted)]">
+            Save label (optional)
+            <input
+              className="mt-0.5 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1 font-mono-n text-[11px]"
+              value={singleRunLabel}
+              onChange={(e) => setSingleRunLabel(e.target.value)}
+              placeholder="e.g. baseline"
+            />
+          </label>
           <button
             type="button"
             disabled={!run}
-            onClick={downloadJson}
-            className="min-w-0 flex-1 rounded-md border border-[var(--border)] px-3 py-2 text-sm hover:bg-[#1a1a1f] disabled:opacity-40"
+            onClick={saveSingleToProject}
+            className="rounded-md bg-zinc-600 px-3 py-1.5 text-xs text-white hover:bg-zinc-500 disabled:opacity-40 sm:shrink-0"
           >
-            Download run JSON
+            Save run to project
           </button>
-          <ParamHelp text="Exports the full serialized run (manifest, per-tick metrics, snapshots) for offline analysis or sharing—lossless relative to what the UI consumed." />
         </div>
-
+            </div>
+          ) : labTab === "grid" ? (
+            <div className="space-y-4">
+        {hydratedActive.gridSession ? (
+          <div className="rounded-md border border-sky-900/45 bg-sky-950/25 px-2.5 py-1.5 text-[11px] text-sky-100">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span>
+                <span className="font-medium">Currently running grid session</span>
+                <span className="text-sky-200/85"> · {sessionProgressText(hydratedActive.gridSession)}</span>
+              </span>
+              <button
+                type="button"
+                className="rounded border border-sky-800/60 px-2 py-0.5 text-[10px] text-sky-50 hover:bg-sky-950/60"
+                onClick={() => setLabTab("queue")}
+              >
+                Open Queue
+              </button>
+            </div>
+          </div>
+        ) : null}
         <BatchGridPanel
           baseConfig={config}
           mode={mode}
           qreTemp={qreTemp}
           onLoadRun={loadGridCell}
-          onBatchFinished={(results, meta) => {
-            if (results.length > 0) {
-              setLastGridBatch({
-                results,
-                constructionLabel: meta.constructionLabel,
-                levelProductLabel: meta.levelProductLabel,
-              });
-            }
-          }}
+          onLabJobRunnerChange={onGridLabJobRunner}
+          onSessionStarted={onGridSessionStarted}
+          persistenceProjectId={selectedProjectId}
+          onBatchFinished={onGridBatchFinished}
         />
-
-        <OptimizationPanel baseConfig={config} mode={mode} qreTemp={qreTemp} onLoadBestRun={loadGridCell} />
-
         <section className="space-y-2 rounded-lg border border-[var(--border)] border-dashed bg-[#0a0a0c] px-3 py-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-xs font-medium text-[var(--muted)]">Batch analytics (local storage)</h3>
-            <Link
-              href="/analysis"
-              className="text-[11px] text-[var(--accent)] hover:underline"
-            >
-              Open analysis chat →
-            </Link>
-          </div>
+          <p className="text-[10px] leading-snug text-[var(--muted)]">
+            Grid batches <strong className="font-medium text-[var(--text)]">auto-save</strong> each cell to SQLite (
+            <code className="font-mono-n">data/sim-queue.db</code>, tables <code className="font-mono-n">lab_*</code>)
+            and a metrics-only batch to the selected project (dual-write: DB is primary for full drill-down via API;
+            project sidebar keeps compact cells for analytics chat).
+          </p>
           {lastGridBatch && lastGridBatch.results.length > 0 ? (
             <p className="text-[10px] text-[var(--muted)]">
               Last finished grid: {lastGridBatch.results.length} cell(s) · {lastGridBatch.constructionLabel} ·{" "}
               {lastGridBatch.levelProductLabel}
             </p>
           ) : (
-            <p className="text-[10px] text-[var(--muted)]">Run a parameter grid batch to enable saving.</p>
+            <p className="text-[10px] text-[var(--muted)]">Run a parameter grid batch to populate history.</p>
           )}
           <div className="flex flex-wrap items-end gap-2">
-            <label className="min-w-[8rem] flex-1 text-[10px] text-[var(--muted)]">
-              Project name
-              <input
-                className="mt-0.5 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1 font-mono-n text-[11px]"
-                value={analysisProjectName}
-                onChange={(e) => setAnalysisProjectName(e.target.value)}
-              />
-            </label>
             <label className="min-w-[8rem] flex-1 text-[10px] text-[var(--muted)]">
               Batch label (optional)
               <input
@@ -1170,35 +1965,104 @@ export function SimulationLab() {
             <button
               type="button"
               disabled={!lastGridBatch || lastGridBatch.results.length === 0}
-              onClick={saveGridToAnalysis}
-              className="rounded-md bg-zinc-600 px-3 py-1.5 text-xs text-white hover:bg-zinc-500 disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={exportLastGridBatchJson}
+              className="rounded-md border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text)] hover:bg-[#1a1a1f] disabled:cursor-not-allowed disabled:opacity-40"
             >
-              Save batch to project
+              Export last batch JSON
             </button>
           </div>
         </section>
-
-        {error && (
-          <p className="rounded border border-red-900/60 bg-red-950/40 p-2 text-xs text-red-200">
-            {error}
+            </div>
+          ) : labTab === "optimize" ? (
+            <div className="space-y-2">
+        {hydratedActive.optimizationSession ? (
+          <div className="rounded-md border border-sky-900/45 bg-sky-950/25 px-2.5 py-1.5 text-[11px] text-sky-100">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span>
+                <span className="font-medium">Currently running optimization session</span>
+                <span className="text-sky-200/85"> · {sessionProgressText(hydratedActive.optimizationSession)}</span>
+              </span>
+              <button
+                type="button"
+                className="rounded border border-sky-800/60 px-2 py-0.5 text-[10px] text-sky-50 hover:bg-sky-950/60"
+                onClick={() => setLabTab("queue")}
+              >
+                Open Queue
+              </button>
+            </div>
+          </div>
+        ) : null}
+        <OptimizationPanel
+          baseConfig={config}
+          mode={mode}
+          qreTemp={qreTemp}
+          onLoadBestRun={loadGridCell}
+          onLabJobRunnerChange={onOptimizationLabJobRunner}
+          onSessionStarted={onOptimizationSessionStarted}
+          persistenceProjectId={selectedProjectId}
+          onSessionCellsFinished={onOptimizationSessionFinished}
+          activeOptimizationSession={hydratedActive.optimizationSession}
+        />
+        <section className="space-y-2 rounded-lg border border-[var(--border)] border-dashed bg-[#0a0a0c] px-3 py-2">
+          <p className="text-[10px] leading-snug text-[var(--muted)]">
+            Each optimization trial <strong className="font-medium text-[var(--text)]">auto-saves</strong> to SQLite (
+            <code className="font-mono-n">lab_trials</code>) with a compact run summary; full runs spill to{" "}
+            <code className="font-mono-n">data/lab-exports/&lt;sessionId&gt;/</code> when large. A metrics-only batch
+            is also written to the selected project (same dual-write pattern as the grid).
           </p>
-        )}
-      </aside>
+          {lastOptimizationCells && lastOptimizationCells.length > 0 ? (
+            <p className="text-[10px] text-[var(--muted)]">
+              Last session: {lastOptimizationCells.length} trial(s) in memory (also on server if dev API is reachable).
+            </p>
+          ) : (
+            <p className="text-[10px] text-[var(--muted)]">Run optimization to record trials.</p>
+          )}
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="min-w-[8rem] flex-1 text-[10px] text-[var(--muted)]">
+              Batch label (optional)
+              <input
+                className="mt-0.5 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1 font-mono-n text-[11px]"
+                value={optimizationBatchName}
+                onChange={(e) => setOptimizationBatchName(e.target.value)}
+                placeholder="auto if empty"
+              />
+            </label>
+            <button
+              type="button"
+              disabled={!lastOptimizationCells || lastOptimizationCells.length === 0}
+              onClick={exportLastOptimizationJson}
+              className="rounded-md border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text)] hover:bg-[#1a1a1f] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Export trials JSON
+            </button>
+          </div>
+        </section>
+            </div>
+          ) : null}
+          {labTab === "queue" ? (
+            <div className="block min-w-0" aria-hidden={false}>
+              <SimQueuePanel />
+            </div>
+          ) : null}
+        </div>
+        </div>
 
-      <section className="space-y-4 rounded-lg border border-[var(--border)] bg-[var(--panel)] p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-sm font-medium">Network · topology at playhead (wealth-sized nodes)</h2>
+        <div className="flex w-full min-w-0 flex-col gap-3 overflow-x-hidden lg:basis-0 lg:shrink lg:grow-[1.1] lg:min-w-[min(100%,380px)] xl:min-w-[min(100%,420px)] lg:max-w-[min(100%,640px)]">
+      <section className="min-w-0 space-y-4 rounded-lg border border-[var(--border)] bg-[var(--panel)] p-3 sm:p-4">
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+          <h2 className="min-w-0 text-sm font-medium sm:text-base">Network · topology at playhead (wealth-sized nodes)</h2>
           <span className="font-mono-n text-xs text-[var(--muted)]">
             tick {displayTick?.metrics.tick ?? "—"} / {run?.history.length ?? 0}
           </span>
         </div>
+        <div ref={graphMeasureRef} className="w-full min-w-0 overflow-x-hidden">
         {run?.finalWorld && agentsAtTick && displayTick ? (
           <>
             <ForceGraph
               agents={agentsAtTick}
               edges={displayTick.edges}
-              width={720}
-              height={420}
+              width={graphDims.width}
+              height={graphDims.height}
               layoutSeed={config.seed}
               selectionResetEpoch={graphSelectionVersion}
               onSelectionChange={(ids) => setSelectedGraphNodeIds([...ids])}
@@ -1263,16 +2127,20 @@ export function SimulationLab() {
             </div>
           </>
         ) : (
-          <div className="flex h-[420px] items-center justify-center rounded border border-dashed border-[var(--border)] text-sm text-[var(--muted)]">
+          <div
+            className="flex w-full min-w-0 items-center justify-center rounded border border-dashed border-[var(--border)] text-sm text-[var(--muted)]"
+            style={{ minHeight: Math.max(220, graphDims.height) }}
+          >
             Run a simulation to populate the collaboration graph.
           </div>
         )}
+        </div>
       </section>
 
-      <aside className="space-y-4 rounded-lg border border-[var(--border)] bg-[var(--panel)] p-4">
+      <aside className="min-w-0 space-y-4 rounded-lg border border-[var(--border)] bg-[var(--panel)] p-3 sm:p-4">
         <h2 className="text-sm font-medium">Society metrics</h2>
         {displayTick ? (
-          <dl className="grid grid-cols-2 gap-2 font-mono-n text-xs">
+          <dl className="grid min-w-0 grid-cols-2 gap-2 font-mono-n text-xs [&_dd]:min-w-0 [&_dd]:break-words [&_dd]:text-end [&_dd]:tabular-nums">
             <dt className="text-[var(--muted)]">Total wealth</dt>
             <dd>{displayTick.metrics.totalWealth.toFixed(1)}</dd>
             <dt className="text-[var(--muted)]">Mean wealth / agent</dt>
@@ -1338,7 +2206,7 @@ export function SimulationLab() {
           <p className="text-sm text-[var(--muted)]">No run yet.</p>
         )}
 
-        <div className="border-t border-[var(--border)] pt-3">
+        <div className="min-w-0 border-t border-[var(--border)] pt-3">
           <h3 className="mb-2 text-xs font-medium text-[var(--muted)]">Time series</h3>
           {run?.history?.length ? (
             <MetricsCharts
@@ -1351,6 +2219,8 @@ export function SimulationLab() {
           )}
         </div>
       </aside>
+        </div>
+      </div>
     </div>
   );
 }

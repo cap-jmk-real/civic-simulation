@@ -28,7 +28,7 @@ pub use rng::{ConstantRng, MulBerry32, Rng01};
 pub use market::parallel::{market_weights_par, spillover_all_par};
 
 pub use optimizer::{
-    apply_genes_to_config, read_optimization_metric, run_genetic_minimize, run_policy_target_search,
-    GeneAxis, GeneticConfig, GeneticResult, OptimizationMetric, PolicySearchParams,
-    PolicySearchResult,
+    apply_genes_to_config, optimization_metric_from_key, parse_gene_axis_id, read_optimization_metric,
+    run_genetic_minimize, run_policy_target_search, GeneAxis, GeneticConfig, GeneticResult,
+    OptimizationMetric, PolicySearchObjective, PolicySearchParams, PolicySearchResult,
 };

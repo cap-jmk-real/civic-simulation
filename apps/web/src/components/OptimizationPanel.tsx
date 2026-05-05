@@ -1,6 +1,6 @@
 "use client";
 
-import type { SimConfig } from "@ip-sim/core";
+import { type SimConfig } from "@ip-sim/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ParamHelp } from "@/components/ParamHelp";
 import {
@@ -16,23 +16,60 @@ import type { GridCellResult } from "@/lib/gridBatchTypes";
 import {
   OPTIMIZATION_METRIC_LABELS,
   readOptimizationMetric,
-  runEvolutionarySearch,
   type OptimizationMetricKey,
   type OptimizationObjective,
+  type OptimizationPolicyMode,
 } from "@/lib/evolutionaryOptimize";
 import {
   innovationFlowAtTick,
   innovationFlowPerAgentAtTick,
   meanWealthAtTick,
 } from "@/lib/runOutcomeMetrics";
+import {
+  clearActiveLabJob,
+  clearActiveLabJobIfId,
+  getLabTabId,
+  isOptimizationProgress,
+  LAB_JOB_HEARTBEAT_MS,
+  newLabJobId,
+  patchActiveLabJob,
+  readActiveLabJob,
+  setActiveLabJob,
+  subscribeLabJobs,
+  type LabJobOptimizationProgress,
+} from "@/lib/labJobStore";
+import {
+  persistLabSessionCreate,
+} from "@/lib/labPersistenceClient";
+import { reviveStoredSingleRun } from "@/lib/analysisStorage";
+import type { LabSessionHydrationSummary } from "@/lib/simQueue/activeRunHydration";
+import {
+  deriveSessionOptimizationSettings,
+  deriveBestOptimizationOverviewRowId,
+  deriveHydratedOptimizationOverviewRows,
+  deriveHydratedOptimizationLiveProgress,
+  deriveOptimizationTrialRunsCountText,
+  deriveOptimizationVisibleTrialRows,
+  formatOptimizationDurationMs,
+  getDefaultOptimizationOverviewSort,
+  isOptimizationOverviewRowBest,
+  isOptimizationOverviewRowPreviewable,
+  deriveOptimizationWaitingDiagnostics,
+  sortOptimizationOverviewRows,
+  shouldRefreshHydratedOverview,
+  type OptimizationOverviewSortDirection,
+  type OptimizationOverviewSortKey,
+  type OptimizationProgressSnapshot,
+  type PersistedOptimizationTrial,
+} from "@/lib/simQueue/optimizationLiveProgress";
 
 const DEFAULT_OPT_AXES: GridAxisId[] = ["policy.enforcementIntensity", "policy.openScienceSubsidy"];
 
 /** Soft cap for GA population size input; hard cap is max eval budget (and absolute grid ceiling). */
 const OPT_GA_MAX_POPULATION = 256;
 const OPT_MAX_SIM_TICKS = 100_000;
-/** Rolling UI cap — full runs are still retained for the current leader + loading the leader. */
-const MAX_OPT_TRIAL_ROWS = 400;
+/** Rolling UI cap for optimization rows; keep memory bounded under long sessions. */
+const MAX_OPT_TRIAL_ROWS = 120;
 
 type OptTrialRow = {
   id: string;
@@ -40,8 +77,13 @@ type OptTrialRow = {
   evaluationNumber: number;
   metricValue: number | null;
   mse: number;
+  finishedAt: string | null;
   label: string;
-  cell: GridCellResult;
+  giniWealth: number | null;
+  meanWealth: number | null;
+  innovationPerAgent: number | null;
+  /** Only retained for leader local preview; other rows hydrate from persistence. */
+  previewRun: GridCellResult["run"] | null;
   /** Wall time for this simulation only */
   durationMs: number | null;
 };
@@ -68,13 +110,33 @@ function formatOptimizationMetricCell(key: OptimizationMetricKey, v: number | nu
   return v.toPrecision(5);
 }
 
+function formatFinishedAt(ts: string): string {
+  const n = Date.parse(ts);
+  if (!Number.isFinite(n)) return "—";
+  return new Date(n).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
 export function OptimizationPanel(props: {
   baseConfig: SimConfig;
   mode: "heuristic" | "qre" | "llm";
   qreTemp: number;
   onLoadBestRun: (cell: GridCellResult) => void;
+  /** Fires after a run segment with all trial cells collected (for saving as an optimization batch). */
+  onSessionCellsFinished?: (
+    cells: GridCellResult[],
+    meta: { sessionId: string | null; cancelled: boolean },
+  ) => void;
+  onLabJobRunnerChange?: (active: boolean) => void;
+  onSessionStarted?: (meta: { sessionId: string }) => void;
+  /** Focus Optimize tab (e.g. from a cross-tab durable notice); optional. */
+  onRequestLabTab?: () => void;
+  /** Linked to analysis project for SQLite `lab_sessions.project_id` (optional). */
+  persistenceProjectId?: string | null;
+  activeOptimizationSession?: LabSessionHydrationSummary | null;
 }) {
+  const initialPolicyMode: OptimizationPolicyMode = props.mode === "qre" ? "qre" : "heuristic";
   const [selectedAxes, setSelectedAxes] = useState<Set<GridAxisId>>(() => new Set(DEFAULT_OPT_AXES));
+  const [policyMode, setPolicyMode] = useState<OptimizationPolicyMode>(initialPolicyMode);
   const [metric, setMetric] = useState<OptimizationMetricKey>("innovationFlowPerAgent");
   const [objective, setObjective] = useState<OptimizationObjective>("target");
   const [targetStr, setTargetStr] = useState("0.05");
@@ -90,6 +152,8 @@ export function OptimizationPanel(props: {
   const resumeBaselineEvalRef = useRef(0);
   const resumeGenBaselineRef = useRef(0);
   const lastBestGenesRef = useRef<number[] | null>(null);
+  const trialCellsSessionRef = useRef<GridCellResult[]>([]);
+  const leaderTrialIdPersistRef = useRef<string | null>(null);
   /** Gene vector length from last finished optimization (for resume eligibility vs axis count). */
   const [resumeGeneCount, setResumeGeneCount] = useState<number | null>(null);
 
@@ -102,7 +166,7 @@ export function OptimizationPanel(props: {
   const [optTicksStr, setOptTicksStr] = useState("");
 
   const [running, setRunning] = useState(false);
-  const cancelRef = useRef(false);
+  const activeLabJobIdRef = useRef<string | null>(null);
   const lastBestRef = useRef<{
     run: GridCellResult["run"];
     assignments: GridCellResult["assignments"];
@@ -129,22 +193,235 @@ export function OptimizationPanel(props: {
   const [leaderRowId, setLeaderRowId] = useState<string | null>(null);
   const [leaderCell, setLeaderCell] = useState<GridCellResult | null>(null);
   const [totalEvalCount, setTotalEvalCount] = useState(0);
-  const [uiClock, setUiClock] = useState(0);
   const [currentEvalLive, setCurrentEvalLive] = useState<{
     evaluationNumber: number;
     generation: number;
     shortLabel: string;
   } | null>(null);
   const [lastWallMs, setLastWallMs] = useState<number | null>(null);
+  const [, labJobUiBump] = useState(0);
+  const [hydratedSnapshot, setHydratedSnapshot] = useState<OptimizationProgressSnapshot | null>(null);
+  const [hydratedOverviewRows, setHydratedOverviewRows] = useState<
+    ReturnType<typeof deriveHydratedOptimizationOverviewRows>
+  >([]);
+  const [overviewSortKey, setOverviewSortKey] = useState<OptimizationOverviewSortKey>(
+    () => getDefaultOptimizationOverviewSort().key,
+  );
+  const [overviewSortDirection, setOverviewSortDirection] = useState<OptimizationOverviewSortDirection>(
+    () => getDefaultOptimizationOverviewSort().direction,
+  );
+  const [selectedOverviewRowId, setSelectedOverviewRowId] = useState<string | null>(null);
+  const [hydratedTrialLoadingId, setHydratedTrialLoadingId] = useState<string | null>(null);
+  const [lastPersistedTrialAt, setLastPersistedTrialAt] = useState<string | null>(null);
+  const hydratedSnapshotRef = useRef<OptimizationProgressSnapshot | null>(null);
+  const lastOverviewFetchAtMsRef = useRef<number | null>(null);
+  const lastOverviewSnapshotRef = useRef<OptimizationProgressSnapshot | null>(null);
+  const hydratedOverviewFetchInFlightRef = useRef(false);
 
   const optimizationRunStartMsRef = useRef<number | null>(null);
   const currentEvalStartMsRef = useRef<number | null>(null);
+  const optimizeStartWarnedRef = useRef(false);
+
+  const activeBackendSession =
+    props.activeOptimizationSession &&
+    (props.activeOptimizationSession.status === "running" || props.activeOptimizationSession.status === "queued")
+      ? props.activeOptimizationSession
+      : null;
+  const hasHydratedRunningSession = !running && activeBackendSession?.status === "running";
+  const hydratedSessionSettings = useMemo(
+    () => deriveSessionOptimizationSettings(props.activeOptimizationSession?.meta),
+    [props.activeOptimizationSession?.meta],
+  );
+  const activeMetric =
+    hasHydratedRunningSession && hydratedSessionSettings.metric != null
+      ? hydratedSessionSettings.metric
+      : metric;
+  const activeObjective =
+    hasHydratedRunningSession && hydratedSessionSettings.objective != null
+      ? hydratedSessionSettings.objective
+      : objective;
+  const activePolicyMode =
+    hasHydratedRunningSession && hydratedSessionSettings.policyMode != null
+      ? hydratedSessionSettings.policyMode
+      : policyMode;
+
+  useEffect(() => {
+    if (!hasHydratedRunningSession) return;
+    if (hydratedSessionSettings.metric != null && hydratedSessionSettings.metric !== metric) {
+      setMetric(hydratedSessionSettings.metric);
+    }
+    if (hydratedSessionSettings.objective != null && hydratedSessionSettings.objective !== objective) {
+      setObjective(hydratedSessionSettings.objective);
+    }
+    if (hydratedSessionSettings.policyMode != null && hydratedSessionSettings.policyMode !== policyMode) {
+      setPolicyMode(hydratedSessionSettings.policyMode);
+    }
+    if (
+      hydratedSessionSettings.objective === "target" &&
+      hydratedSessionSettings.target != null &&
+      Number.isFinite(hydratedSessionSettings.target)
+    ) {
+      const next = String(hydratedSessionSettings.target);
+      if (next !== targetStr) setTargetStr(next);
+    }
+  }, [
+    hasHydratedRunningSession,
+    hydratedSessionSettings.metric,
+    hydratedSessionSettings.objective,
+    hydratedSessionSettings.policyMode,
+    hydratedSessionSettings.target,
+    metric,
+    objective,
+    policyMode,
+    targetStr,
+  ]);
+
+  useEffect(() => {
+    if (hasHydratedRunningSession || props.mode === "llm") return;
+    const next: OptimizationPolicyMode = props.mode === "qre" ? "qre" : "heuristic";
+    if (policyMode !== next) setPolicyMode(next);
+  }, [hasHydratedRunningSession, policyMode, props.mode]);
+
+  useEffect(() => {
+    props.onLabJobRunnerChange?.(running);
+  }, [running, props.onLabJobRunnerChange]);
+
+  useEffect(() => subscribeLabJobs(() => labJobUiBump((n) => n + 1)), []);
+
+  useEffect(() => {
+    if (!hasHydratedRunningSession) {
+      setHydratedSnapshot(null);
+      return;
+    }
+    const sessionId = props.activeOptimizationSession?.id;
+    if (!sessionId) return;
+    let alive = true;
+    const refresh = async () => {
+      try {
+        const res = await fetch(`/api/lab/sessions/${encodeURIComponent(sessionId)}/progress`, {
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          progress?: { evaluationIndex?: number; generation?: number; trialCount?: number } | null;
+        };
+        const p = json.progress;
+        if (!alive || !p) return;
+        if (typeof p.evaluationIndex !== "number" || typeof p.generation !== "number") return;
+        setHydratedSnapshot({
+          evaluationIndex: p.evaluationIndex,
+          generation: p.generation,
+          trialCount: typeof p.trialCount === "number" ? p.trialCount : p.evaluationIndex,
+        });
+      } catch {
+        /* keep stale snapshot on transient errors */
+      }
+    };
+    void refresh();
+    const t = window.setInterval(() => void refresh(), 1500);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [hasHydratedRunningSession, props.activeOptimizationSession?.id]);
+
+  useEffect(() => {
+    hydratedSnapshotRef.current = hydratedSnapshot;
+  }, [hydratedSnapshot]);
+
+  useEffect(() => {
+    if (!hasHydratedRunningSession) {
+      setHydratedOverviewRows([]);
+      setLastPersistedTrialAt(null);
+      lastOverviewFetchAtMsRef.current = null;
+      lastOverviewSnapshotRef.current = null;
+      hydratedOverviewFetchInFlightRef.current = false;
+      return;
+    }
+    const sessionId = props.activeOptimizationSession?.id;
+    if (!sessionId) return;
+    let alive = true;
+    const refresh = async () => {
+      if (hydratedOverviewFetchInFlightRef.current) return;
+      const nowMs = Date.now();
+      if (
+        !shouldRefreshHydratedOverview({
+          snapshot: hydratedSnapshotRef.current,
+          lastSnapshot: lastOverviewSnapshotRef.current,
+          nowMs,
+          lastFetchAtMs: lastOverviewFetchAtMsRef.current,
+          maxIdleMs: 8_000,
+        })
+      ) {
+        return;
+      }
+      hydratedOverviewFetchInFlightRef.current = true;
+      try {
+        const res = await fetch(`/api/lab/sessions/${encodeURIComponent(sessionId)}/trials`, {
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+        const json = (await res.json()) as { trials?: PersistedOptimizationTrial[] };
+        if (!alive || !Array.isArray(json.trials)) return;
+        const snapshotForOverview = hydratedSnapshotRef.current;
+        const overview = deriveHydratedOptimizationOverviewRows({
+          trials: json.trials,
+          snapshot: snapshotForOverview,
+          cap: MAX_OPT_TRIAL_ROWS,
+        });
+        const latestFinishedAt = overview[0]?.finishedAt ?? null;
+        setHydratedOverviewRows(overview);
+        setLastPersistedTrialAt(latestFinishedAt);
+        lastOverviewFetchAtMsRef.current = nowMs;
+        lastOverviewSnapshotRef.current = snapshotForOverview;
+      } catch {
+        /* Keep stale finished rows on transient API errors. */
+      } finally {
+        hydratedOverviewFetchInFlightRef.current = false;
+      }
+    };
+    void refresh();
+    const t = window.setInterval(() => void refresh(), 2500);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [hasHydratedRunningSession, props.activeOptimizationSession?.id]);
+
+  const hydratedSelectionStorageKey = useMemo(() => {
+    const sessionId = props.activeOptimizationSession?.id;
+    return sessionId ? `opt.preview.selection.${sessionId}` : null;
+  }, [props.activeOptimizationSession?.id]);
+
+  useEffect(() => {
+    if (running) return;
+    if (!hydratedSelectionStorageKey) {
+      setSelectedOverviewRowId(null);
+      return;
+    }
+    try {
+      const raw = window.localStorage.getItem(hydratedSelectionStorageKey);
+      if (raw && raw.length > 0) setSelectedOverviewRowId(raw);
+    } catch {
+      /* ignore storage read errors */
+    }
+  }, [hydratedSelectionStorageKey, running]);
 
   useEffect(() => {
     if (!running) return;
-    const id = window.setInterval(() => setUiClock((c) => c + 1), 250);
-    return () => window.clearInterval(id);
+    const id = activeLabJobIdRef.current;
+    if (!id) return;
+    const t = window.setInterval(() => patchActiveLabJob(id, {}), LAB_JOB_HEARTBEAT_MS);
+    return () => window.clearInterval(t);
   }, [running]);
+
+  const interruptedOptimizationJob = (() => {
+    const j = readActiveLabJob();
+    if (!j || j.status !== "running" || j.type !== "optimization") return null;
+    if (j.ownerTabId !== getLabTabId()) return null;
+    if (running) return null;
+    return j;
+  })();
 
   const toggleAxis = useCallback((id: GridAxisId) => {
     setSelectedAxes((prev) => {
@@ -207,8 +484,8 @@ export function OptimizationPanel(props: {
   const evalOverBudget = evalEstimate > maxOptEvalCap;
 
   const startDisabled =
-    props.mode !== "heuristic" ||
     running ||
+    activeBackendSession != null ||
     axisIds.length === 0 ||
     (objective === "target" && !Number.isFinite(target)) ||
     evalOverBudget ||
@@ -218,7 +495,7 @@ export function OptimizationPanel(props: {
 
   const runOptimization = useCallback(
     async (sessionMode: "fresh" | "continue") => {
-      if (props.mode !== "heuristic" || running || axisIds.length === 0) return;
+      if (running || axisIds.length === 0) return;
       if (objective === "target" && !Number.isFinite(target)) return;
       if (plannedGridN < 1) return;
 
@@ -234,13 +511,12 @@ export function OptimizationPanel(props: {
         const g = lastBestGenesRef.current;
         if (!g || g.length !== axisIds.length) return;
       }
-
-      cancelRef.current = false;
-      setRunning(true);
       setProgress(null);
       setResult(null);
-      optimizationRunStartMsRef.current = Date.now();
-      currentEvalStartMsRef.current = null;
+      if (sessionMode === "fresh") {
+        trialCellsSessionRef.current = [];
+        leaderTrialIdPersistRef.current = null;
+      }
 
       setSegmentPlannedEvals(segmentEvals);
       if (sessionMode === "fresh") {
@@ -262,128 +538,61 @@ export function OptimizationPanel(props: {
         setSegmentGenDisplayEnd(gg + gens);
       }
 
+      const jobId = newLabJobId();
+      activeLabJobIdRef.current = jobId;
+      props.onSessionStarted?.({ sessionId: jobId });
+      await persistLabSessionCreate({
+        id: jobId,
+        sessionType: "optimization",
+        status: "queued",
+        projectId: props.persistenceProjectId ?? null,
+        meta: {
+          label: sessionMode === "continue" ? "Optimization · continue" : "Optimization",
+          metric,
+          objective,
+          target: objective === "target" ? target : null,
+          axisIds,
+          mode: props.mode,
+          policyMode: activePolicyMode,
+          qreTemp: activePolicyMode === "qre" ? props.qreTemp : null,
+          baseSeed: props.baseConfig.seed,
+          cohortPlannedN: plannedGridN,
+          ticks: effectiveTicks,
+          sessionMode,
+          populationSize,
+          generations: gens,
+          mutationRate,
+          maxAgentsCap: maxAgentsCap ?? null,
+          maxEvalBudget: maxOptEvalCap,
+          baseConfig: optBaseConfig,
+          evaluationNumberOffset: resumeBaselineEvalRef.current,
+          generationDisplayOffset: resumeGenBaselineRef.current,
+        },
+      });
+      setActiveLabJob({
+        id: jobId,
+        type: "optimization",
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        status: "running",
+        label: sessionMode === "continue" ? "Optimization queued · continue segment" : "Optimization queued",
+        progress: {
+          evaluations: resumeBaselineEvalRef.current,
+          planned: segmentEvals,
+          generation: resumeGenBaselineRef.current,
+        },
+        ownerTabId: getLabTabId(),
+        payload: { sessionMode, populationSize, generations: gens, policyMode: activePolicyMode },
+      });
+
       setCurrentEvalLive(null);
       setLastWallMs(null);
-
-      try {
-        const out = await runEvolutionarySearch({
-        baseConfig: optBaseConfig,
-        mode: props.mode,
-        qreTemp: props.qreTemp,
-        axisIds,
-        metric,
-        target,
-        objective,
-        maxAgentsCap,
-        populationSize,
-        generations: gens,
-        mutationRate,
-        resumeFromBestGenes:
-          sessionMode === "continue" ? lastBestGenesRef.current ?? undefined : undefined,
-        evaluationNumberOffset: resumeBaselineEvalRef.current,
-        generationDisplayOffset: resumeGenBaselineRef.current,
-        shouldCancel: () => cancelRef.current,
-        yieldToUi: () => new Promise((r) => requestAnimationFrame(() => r())),
-        onEvaluationBegin: (beg) => {
-          const parts = beg.assignments.map((a) => {
-            const def = getGridAxisDefinition(a.id);
-            return `${def.short} ${formatAxisCellValue(a.value)}`;
-          });
-          currentEvalStartMsRef.current = Date.now();
-          setCurrentEvalLive({
-            evaluationNumber: beg.evaluationNumber,
-            generation: beg.generation,
-            shortLabel: parts.join(" · "),
-          });
-        },
-        onEvaluation: (ev) => {
-          const durMs =
-            currentEvalStartMsRef.current != null ? Date.now() - currentEvalStartMsRef.current : null;
-          currentEvalStartMsRef.current = null;
-          setCurrentEvalLive(null);
-
-          setTotalEvalCount(ev.evaluationNumber);
-          const parts = ev.assignments.map((a) => {
-            const def = getGridAxisDefinition(a.id);
-            return `${def.short} ${formatAxisCellValue(a.value)}`;
-          });
-          const shortLabel = parts.join(" · ");
-          const label = `G${ev.generation + 1} #${ev.evaluationNumber} · ${shortLabel}`;
-          const id = `opt_e_${ev.evaluationNumber}_${props.baseConfig.seed}`;
-          const cell: GridCellResult = {
-            id,
-            label: `Opt · ${label}`,
-            assignments: ev.assignments,
-            run: ev.run as GridCellResult["run"],
-          };
-          setTrialRows((prev) => {
-            const row: OptTrialRow = {
-              id,
-              generation: ev.generation,
-              evaluationNumber: ev.evaluationNumber,
-              metricValue: ev.metricValue,
-              mse: ev.mse,
-              label: shortLabel,
-              cell,
-              durationMs: durMs,
-            };
-            const next = [...prev, row];
-            while (next.length > MAX_OPT_TRIAL_ROWS) next.shift();
-            return next;
-          });
-          if (ev.isNewBest) {
-            setLeaderRowId(id);
-            setLeaderCell(cell);
-          }
-        },
-        onGeneration: ({ generation, bestMse, evaluations }) => {
-          setProgress({
-            generation,
-            evaluations,
-            bestRmse: Math.sqrt(Math.max(0, bestMse)),
-            bestMetric: -bestMse,
-            progressObjective: objective,
-          });
-        },
-      });
-
-      const last = out.bestRun.history[out.bestRun.history.length - 1];
-      const achieved = last ? readOptimizationMetric(last, metric) : null;
-      const labelParts = out.bestAssignments.map((a) => {
-        const def = getGridAxisDefinition(a.id);
-        return `${def.short} ${formatAxisCellValue(a.value)}`;
-      });
-      const assignmentsLabel = labelParts.join(" · ");
-      setResult({
-        objective,
-        rmse: objective === "target" ? Math.sqrt(Math.max(0, out.bestMse)) : null,
-        achieved: achieved != null && Number.isFinite(achieved) ? achieved : null,
-        assignmentsLabel,
-        evaluations: out.evaluations,
-        cancelled: out.cancelled,
-      });
-      lastBestRef.current = {
-        run: out.bestRun as GridCellResult["run"],
-        assignments: out.bestAssignments,
-        label: `Opt · ${assignmentsLabel}`,
-      };
-      lastBestGenesRef.current = out.bestGenes;
-      setResumeGeneCount(out.bestGenes.length);
-      resumeBaselineEvalRef.current += out.evaluations;
-      resumeGenBaselineRef.current += out.generationsCompleted;
-    } finally {
-      const startedAt = optimizationRunStartMsRef.current;
-      if (startedAt != null) setLastWallMs(Date.now() - startedAt);
-      cancelRef.current = false;
-      setRunning(false);
-      setCurrentEvalLive(null);
-      currentEvalStartMsRef.current = null;
-    }
   }, [
     axisIds,
     evalOverBudget,
     generations,
     maxAgentsCap,
+    activePolicyMode,
     metric,
     mutationRate,
     objective,
@@ -392,10 +601,10 @@ export function OptimizationPanel(props: {
     populationSize,
     props.mode,
     props.qreTemp,
-    props.baseConfig.seed,
     target,
     continueGenerations,
     maxOptEvalCap,
+    props.persistenceProjectId,
   ]);
 
   const loadBestRun = useCallback(() => {
@@ -420,6 +629,54 @@ export function OptimizationPanel(props: {
     if (leaderCell) props.onLoadBestRun({ ...leaderCell, id: `${leaderCell.id}_lead_${Date.now()}` });
   }, [leaderCell, props]);
 
+  const loadHydratedTrialById = useCallback(
+    async (trialId: string) => {
+      const sessionId = props.activeOptimizationSession?.id;
+      if (!sessionId) return;
+      setHydratedTrialLoadingId(trialId);
+      try {
+        const res = await fetch(
+          `/api/lab/sessions/${encodeURIComponent(sessionId)}/trials/${encodeURIComponent(trialId)}`,
+          { cache: "no-store" },
+        );
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          trial?: {
+            id: string;
+            generation: number;
+            evaluationIndex: number;
+            assignments: unknown;
+            fullRunJson: string | null;
+          };
+        };
+        if (!json.trial?.fullRunJson) return;
+        const run = reviveStoredSingleRun(json.trial.fullRunJson);
+        const cell: GridCellResult = {
+          id: `hydrated_${json.trial.id}`,
+          label: `Opt · G${json.trial.generation + 1} #${json.trial.evaluationIndex}`,
+          assignments: Array.isArray(json.trial.assignments)
+            ? (json.trial.assignments as GridCellResult["assignments"])
+            : [],
+          run: run as GridCellResult["run"],
+        };
+        props.onLoadBestRun({ ...cell, id: `${cell.id}_v_${Date.now()}` });
+        setSelectedOverviewRowId(trialId);
+        if (hydratedSelectionStorageKey) {
+          try {
+            window.localStorage.setItem(hydratedSelectionStorageKey, trialId);
+          } catch {
+            /* ignore storage write errors */
+          }
+        }
+      } catch {
+        /* ignore transient load failures */
+      } finally {
+        setHydratedTrialLoadingId((prev) => (prev === trialId ? null : prev));
+      }
+    },
+    [hydratedSelectionStorageKey, props],
+  );
+
   const segmentDoneEvals = Math.max(0, totalEvalCount - segmentEvalBaseline);
   const segPlan = segmentPlannedEvals > 0 ? segmentPlannedEvals : evalEstimate;
   const runStartMs = optimizationRunStartMsRef.current;
@@ -437,40 +694,239 @@ export function OptimizationPanel(props: {
       ? ((Date.now() - runStartMs) / segmentDoneEvals) * (segPlan - segmentDoneEvals)
       : null;
 
+  useEffect(() => {
+    if (!running) return;
+    const id = window.setInterval(() => {
+      const startedAt = optimizationRunStartMsRef.current;
+      if (startedAt == null || optimizeStartWarnedRef.current) return;
+      if (totalEvalCount > segmentEvalBaseline) return;
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < 45_000) return;
+      optimizeStartWarnedRef.current = true;
+      console.warn("[OptimizationPanel] Slow optimize start detected", {
+        elapsedMs: elapsed,
+        segmentPlannedEvals,
+        segmentEvalBaseline,
+        axisCount: axisIds.length,
+        policyMode: activePolicyMode,
+      });
+    }, 5_000);
+    return () => window.clearInterval(id);
+  }, [
+    activePolicyMode,
+    axisIds.length,
+    running,
+    segmentEvalBaseline,
+    segmentPlannedEvals,
+    totalEvalCount,
+  ]);
+
   const continueEvalBudget = populationSize * Math.max(1, continueGenerations);
   const continueOverBudget = continueEvalBudget > maxOptEvalCap;
   const resumeMatchesAxes =
     resumeGeneCount != null && resumeGeneCount === axisIds.length && axisIds.length > 0;
   const continueDisabled =
-    props.mode !== "heuristic" ||
     running ||
+    activeBackendSession != null ||
     !resumeMatchesAxes ||
     continueOverBudget ||
     plannedGridN < 1 ||
     (objective === "target" && !Number.isFinite(target));
 
+  const localHydratedProgress: LabJobOptimizationProgress | null = (() => {
+    const active = readActiveLabJob();
+    if (!active || active.type !== "optimization") return null;
+    if (!isOptimizationProgress(active.progress)) return null;
+    if (props.activeOptimizationSession?.id && active.id !== props.activeOptimizationSession.id) return null;
+    return active.progress;
+  })();
+
+  const hydratedLive =
+    hasHydratedRunningSession && props.activeOptimizationSession
+      ? deriveHydratedOptimizationLiveProgress({
+          session: props.activeOptimizationSession,
+          snapshot: hydratedSnapshot,
+          localProgress: localHydratedProgress,
+          nowMs: Date.now(),
+        })
+      : null;
+
+  const displayDoneEvals = running ? segmentDoneEvals : hydratedLive?.evaluations ?? 0;
+  const displayPlan = running ? segPlan : Math.max(1, hydratedLive?.planned ?? hydratedLive?.evaluations ?? 1);
+  const displayProgressPct = displayPlan > 0 ? Math.min(100, (displayDoneEvals / displayPlan) * 100) : 0;
+  const displayElapsedMs = running ? liveElapsedMs : (hydratedLive?.elapsedMs ?? null);
+  const displayEtaMs =
+    running && etaMs != null
+      ? etaMs
+      : !running &&
+          hydratedLive?.throughputPerSec != null &&
+          hydratedLive.throughputPerSec > 0 &&
+          displayPlan > displayDoneEvals
+        ? ((displayPlan - displayDoneEvals) / hydratedLive.throughputPerSec) * 1000
+        : null;
+
+  const localOverviewRows = trialRows
+    .slice()
+    .reverse()
+    .map((row) => ({
+      id: row.id,
+      generation: row.generation,
+      evaluationNumber: row.evaluationNumber,
+      metricValue: row.metricValue,
+      mse: row.mse,
+      rmse: Number.isFinite(Math.sqrt(Math.max(0, row.mse))) ? Math.sqrt(Math.max(0, row.mse)) : null,
+      durationMs: row.durationMs,
+      finishedAt: row.finishedAt,
+      source: "local" as const,
+      status: "finished" as const,
+      isBest: row.id === leaderRowId,
+      hasPreviewRun: true,
+    }));
+  const overviewRows = running ? localOverviewRows : hydratedOverviewRows;
+  const resolvedBestOverviewRowId = useMemo(() => {
+    if (running) return leaderRowId;
+    return deriveBestOptimizationOverviewRowId({
+      rows: overviewRows,
+      objective: activeObjective,
+    });
+  }, [activeObjective, leaderRowId, overviewRows, running]);
+  const sortedOverviewRows = sortOptimizationOverviewRows({
+    rows: overviewRows,
+    key: overviewSortKey,
+    direction: overviewSortDirection,
+  });
+  useEffect(() => {
+    if (!selectedOverviewRowId) return;
+    if (overviewRows.some((row) => row.id === selectedOverviewRowId)) return;
+    setSelectedOverviewRowId(null);
+    if (hydratedSelectionStorageKey) {
+      try {
+        window.localStorage.removeItem(hydratedSelectionStorageKey);
+      } catch {
+        /* ignore storage write errors */
+      }
+    }
+  }, [hydratedSelectionStorageKey, overviewRows, selectedOverviewRowId]);
+  const derivedLastTrialAt = running ? (localOverviewRows[0]?.finishedAt ?? null) : lastPersistedTrialAt;
+  const waitingDiagnostics = deriveOptimizationWaitingDiagnostics({
+    running: running || !!hydratedLive,
+    hasCurrentEvaluation: running && currentEvalLive != null,
+    lastPersistedTrialAt: derivedLastTrialAt,
+    nowMs: Date.now(),
+    staleThresholdMs: 30_000,
+  });
+
+  const toggleOverviewSort = (key: OptimizationOverviewSortKey) => {
+    if (overviewSortKey === key) {
+      setOverviewSortDirection((prev) => (prev === "asc" ? "desc" : "asc"));
+      return;
+    }
+    setOverviewSortKey(key);
+    if (key === "finishedAt" || key === "evaluation" || key === "generation") {
+      setOverviewSortDirection("desc");
+      return;
+    }
+    setOverviewSortDirection("asc");
+  };
+
+  const handleOverviewRowClick = useCallback(
+    (rowId: string, source: "local" | "persisted", previewable: boolean) => {
+      if (!previewable) return;
+      if (source === "local") {
+        const local = trialRows.find((row) => row.id === rowId);
+        if (!local) return;
+        if (local.previewRun) {
+          loadTrialCell({
+            id: local.id,
+            label: `Opt · G${local.generation + 1} #${local.evaluationNumber}`,
+            assignments: [],
+            run: local.previewRun,
+          });
+          setSelectedOverviewRowId(rowId);
+          return;
+        }
+        void loadHydratedTrialById(rowId);
+        return;
+      }
+      void loadHydratedTrialById(rowId);
+    },
+    [loadHydratedTrialById, loadTrialCell, trialRows],
+  );
+
+  const trialRunsCountText = deriveOptimizationTrialRunsCountText({
+    running,
+    totalEvalCount,
+    localWindowCount: trialRows.length,
+    overviewCount: overviewRows.length,
+  });
+  const visibleTrialRows = deriveOptimizationVisibleTrialRows({
+    rows: trialRows,
+    running,
+    maxLiveRows: 40,
+  });
+
   return (
-    <details className="rounded-lg border border-[var(--border)] border-dashed bg-[#0a0a0c] px-3 py-2" open>
+    <details className="rounded-lg border border-[var(--border)] border-dashed bg-[#0a0a0c] px-2.5 py-1.5 lg:px-2 lg:py-1.5" open>
       <summary className="cursor-pointer list-none text-xs font-medium text-[var(--muted)] [&::-webkit-details-marker]:hidden">
         <span className="inline-flex flex-wrap items-center gap-1">
           Outcome optimization
-          <ParamHelp text="Genetic search over checked axes with a rolling trial table like the parameter grid: each evaluation loads into the main viewer for replay (network, metrics, timeline). Trials run the Rust/WASM heuristic simulation. Current leader is highlighted; cohort/ticks come from the section above. Only policy mode Heuristic is supported (not LLM or QRE)." />
+          <ParamHelp text="One genetic algorithm over checked axes. This panel enqueues backend optimization sessions only; worker progress/trials hydrate from server persistence (no in-browser optimization execution path)." />
         </span>
       </summary>
 
-      <div className="mt-2 space-y-2 border-t border-[var(--border)] pt-2">
-        {props.mode !== "heuristic" ? (
-          <p className="text-[10px] text-amber-100/90">
-            Outcome optimization runs the Rust/WASM heuristic engine only; switch policy mode to Heuristic.
-          </p>
+      <div className="mt-1.5 space-y-1.5 border-t border-[var(--border)] pt-1.5 lg:space-y-1">
+        {interruptedOptimizationJob ? (
+          <div
+            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-900/55 bg-amber-950/30 px-2.5 py-2 text-[11px] text-amber-100"
+            role="status"
+          >
+            <div className="min-w-0 space-y-1">
+              <p>
+                <span className="font-medium">Previous optimization interrupted</span>
+                {isOptimizationProgress(interruptedOptimizationJob.progress) ? (
+                  <span className="text-amber-100/85">
+                    {" "}
+                    · last progress {interruptedOptimizationJob.progress.evaluations.toLocaleString("en-US")} /{" "}
+                    {interruptedOptimizationJob.progress.planned.toLocaleString("en-US")} evals
+                    {interruptedOptimizationJob.progress.generation != null
+                      ? ` · gen ${interruptedOptimizationJob.progress.generation + 1}`
+                      : ""}
+                  </span>
+                ) : null}
+              </p>
+              <p className="text-[10px] leading-snug text-amber-100/75">
+                {resumeMatchesAxes
+                  ? "Resume genes still match this session’s axes — you can use “Continue for N gens…” without auto-starting. Refresh clears trial rows; only continue if you still have a leader in memory."
+                  : "Reload cleared trial memory and gene vectors. Start a fresh run or load trials from a saved project batch if you need prior work."}
+              </p>
+            </div>
+            <span className="flex shrink-0 flex-wrap items-center gap-1.5">
+              {props.onRequestLabTab ? (
+                <button
+                  type="button"
+                  className="rounded border border-amber-800/60 px-2 py-0.5 text-[10px] text-amber-50 hover:bg-amber-950/50"
+                  onClick={() => props.onRequestLabTab?.()}
+                >
+                  Focus Optimize tab
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="rounded border border-zinc-600 px-2 py-0.5 text-[10px] text-zinc-200 hover:bg-zinc-800/80"
+                onClick={() => clearActiveLabJob()}
+              >
+                Dismiss
+              </button>
+            </span>
+          </div>
         ) : null}
 
         <section
-          className="space-y-2 rounded-lg border border-[var(--border)] bg-[#0c0c10] px-2.5 py-2"
+          className="space-y-1.5 rounded-lg border border-[var(--border)] bg-[#0c0c10] px-2 py-1.5"
           aria-label="Optimization cohort and run length"
         >
           <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">Cohort &amp; duration</div>
-          <div className="flex flex-wrap items-end gap-2">
+          <div className="grid gap-1.5 sm:grid-cols-2 xl:grid-cols-4">
             <label className="flex min-w-[8.5rem] flex-col gap-0.5 text-[10px] text-[var(--muted)]">
               <span className="inline-flex items-center gap-0.5">
                 Planned total N (cohort)
@@ -485,7 +941,7 @@ export function OptimizationPanel(props: {
                 onChange={(e) => setPlannedTotalAgentsStr(e.target.value)}
               />
             </label>
-            <span className="inline-flex items-center gap-0.5 self-end">
+            <span className="inline-flex items-end gap-0.5">
               <button
                 type="button"
                 className="shrink-0 rounded border border-[var(--border)] px-2 py-1 text-[10px] text-[var(--text)] hover:bg-[#1a1a1f]"
@@ -510,7 +966,7 @@ export function OptimizationPanel(props: {
                 onChange={(e) => setOptTicksStr(e.target.value)}
               />
             </label>
-            <span className="inline-flex items-center gap-0.5 self-end">
+            <span className="inline-flex items-end gap-0.5">
               <button
                 type="button"
                 className="shrink-0 rounded border border-[var(--border)] px-2 py-1 text-[10px] text-[var(--text)] hover:bg-[#1a1a1f]"
@@ -521,7 +977,7 @@ export function OptimizationPanel(props: {
               <ParamHelp text={`Clear override — trials use Run sidebar ticks (${props.baseConfig.ticks}).`} />
             </span>
           </div>
-          <div className="flex flex-wrap items-end gap-2">
+          <div className="grid gap-1.5 sm:grid-cols-2">
             <label className="flex min-w-[8rem] flex-col gap-0.5 text-[10px] text-[var(--muted)]">
               <span className="inline-flex items-center gap-0.5">
                 Max eval budget
@@ -581,7 +1037,8 @@ export function OptimizationPanel(props: {
               </button>
             </span>
           </div>
-          <div className="max-h-36 space-y-0.5 overflow-y-auto text-[11px]">
+          <div className="max-h-28 overflow-y-auto text-[11px] lg:max-h-32">
+            <div className="grid grid-cols-1 gap-x-3 gap-y-0.5 sm:grid-cols-2">
             {GRID_AXIS_DEFINITIONS.map((d) => (
               <label key={d.id} className="flex cursor-pointer items-center gap-2">
                 <input
@@ -595,62 +1052,76 @@ export function OptimizationPanel(props: {
                 </span>
               </label>
             ))}
+            </div>
           </div>
         </div>
 
-        <label className="block text-[10px] text-[var(--muted)]">
-          Target metric
-          <select
-            className="mt-0.5 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1 text-[11px]"
-            value={metric}
-            onChange={(e) => setMetric(e.target.value as OptimizationMetricKey)}
-          >
-            {(Object.keys(OPTIMIZATION_METRIC_LABELS) as OptimizationMetricKey[]).map((k) => (
-              <option key={k} value={k}>
-                {OPTIMIZATION_METRIC_LABELS[k]}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div className="grid gap-1.5 md:grid-cols-3">
+          <label className="block text-[10px] text-[var(--muted)] md:col-span-1">
+            Policy mode
+            <select
+              className="mt-0.5 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1 text-[11px]"
+              value={policyMode}
+              onChange={(e) => setPolicyMode(e.target.value as OptimizationPolicyMode)}
+            >
+              <option value="heuristic">Heuristic (fast)</option>
+              <option value="qre">QRE / softmax (fast)</option>
+            </select>
+          </label>
+          <label className="block text-[10px] text-[var(--muted)] md:col-span-1">
+            Target metric
+            <select
+              className="mt-0.5 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1 text-[11px]"
+              value={metric}
+              onChange={(e) => setMetric(e.target.value as OptimizationMetricKey)}
+            >
+              {(Object.keys(OPTIMIZATION_METRIC_LABELS) as OptimizationMetricKey[]).map((k) => (
+                <option key={k} value={k}>
+                  {OPTIMIZATION_METRIC_LABELS[k]}
+                </option>
+              ))}
+            </select>
+          </label>
 
-        <fieldset className="space-y-1 border-0 p-0">
-          <legend className="text-[10px] text-[var(--muted)]">Objective</legend>
-          <div className="flex flex-wrap gap-3 text-[11px]">
-            <label className="inline-flex cursor-pointer items-center gap-1.5">
-              <input
-                type="radio"
-                name="opt-objective"
-                checked={objective === "target"}
-                onChange={() => setObjective("target")}
-                className="rounded-full border-[var(--border)]"
-              />
-              Match target value
-            </label>
-            <label className="inline-flex cursor-pointer items-center gap-1.5">
-              <input
-                type="radio"
-                name="opt-objective"
-                checked={objective === "maximize"}
-                onChange={() => setObjective("maximize")}
-                className="rounded-full border-[var(--border)]"
-              />
-              Maximize metric
-            </label>
-          </div>
-        </fieldset>
+          <fieldset className="space-y-1 border-0 p-0 md:col-span-1">
+            <legend className="text-[10px] text-[var(--muted)]">Objective</legend>
+            <div className="flex flex-wrap gap-2 text-[11px]">
+              <label className="inline-flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="radio"
+                  name="opt-objective"
+                  checked={objective === "target"}
+                  onChange={() => setObjective("target")}
+                  className="rounded-full border-[var(--border)]"
+                />
+                Match target
+              </label>
+              <label className="inline-flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="radio"
+                  name="opt-objective"
+                  checked={objective === "maximize"}
+                  onChange={() => setObjective("maximize")}
+                  className="rounded-full border-[var(--border)]"
+                />
+                Maximize
+              </label>
+            </div>
+          </fieldset>
 
-        <label className={`block text-[10px] text-[var(--muted)] ${objective !== "target" ? "opacity-50" : ""}`}>
-          Target value
-          <input
-            className="mt-0.5 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1 font-mono-n text-[11px] disabled:cursor-not-allowed"
-            value={targetStr}
-            onChange={(e) => setTargetStr(e.target.value)}
-            disabled={objective !== "target"}
-            aria-disabled={objective !== "target"}
-          />
-        </label>
+          <label className={`block text-[10px] text-[var(--muted)] md:col-span-1 ${objective !== "target" ? "opacity-50" : ""}`}>
+            Target value
+            <input
+              className="mt-0.5 w-full rounded border border-[var(--border)] bg-[#0d0d0f] px-2 py-1 font-mono-n text-[11px] disabled:cursor-not-allowed"
+              value={targetStr}
+              onChange={(e) => setTargetStr(e.target.value)}
+              disabled={objective !== "target"}
+              aria-disabled={objective !== "target"}
+            />
+          </label>
+        </div>
 
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-2 gap-1.5 md:grid-cols-3">
           <label className="text-[10px] text-[var(--muted)]">
             <span className="inline-flex items-center gap-0.5">
               GA population
@@ -700,30 +1171,55 @@ export function OptimizationPanel(props: {
           {evalOverBudget ? " Lower population or generations, or raise the budget field." : ""}
         </p>
 
-        <div className="relative z-30 flex flex-wrap gap-1.5">
-          <button
-            type="button"
-            disabled={startDisabled}
-            onClick={() => void runOptimization("fresh")}
-            className="rounded-md bg-emerald-900/60 px-3 py-1.5 text-xs font-medium text-emerald-100 hover:bg-emerald-800/60 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {running ? "Optimizing…" : "Run optimization"}
-          </button>
-          <button
-            type="button"
-            disabled={!running}
-            title="Sets cancel — honored between evaluations (after requestAnimationFrame yields), not during a WASM simulation call."
-            onClick={() => {
-              cancelRef.current = true;
-            }}
-            className="pointer-events-auto rounded-md border border-red-900/50 bg-red-950/40 px-3 py-1.5 text-xs text-red-100 hover:bg-red-950/70 disabled:opacity-40"
-          >
-            Stop
-          </button>
-        </div>
+        <section className="space-y-1 rounded border border-[var(--border)] bg-[#0c0c10] px-2 py-1.5 text-[10px]">
+          <div className="font-semibold uppercase tracking-wide text-[var(--muted)]">Execution path</div>
+          <p className="text-[var(--muted)]">
+            Optimization runs are backend-only. This tab enqueues one optimization session into the worker queue and
+            streams persisted progress/trials from the server.
+          </p>
+        </section>
 
-        <div className="flex flex-wrap items-end gap-2 rounded border border-[var(--border)] border-dashed bg-[#0c0c10] px-2 py-2">
-          <label className="text-[10px] text-[var(--muted)]">
+        <div className="rounded border border-[var(--border)] border-dashed bg-[#0c0c10] px-2 py-1.5">
+          <div className="relative z-30 flex flex-wrap gap-1.5">
+            <button
+              type="button"
+              disabled={startDisabled}
+              aria-busy={running}
+              onClick={() => void runOptimization("fresh")}
+              className="rounded-md bg-emerald-900/60 px-3 py-1 text-xs font-medium text-emerald-100 hover:bg-emerald-800/60 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                {running ? (
+                  <span
+                    className="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent"
+                    aria-hidden="true"
+                  />
+                ) : null}
+                <span>{running ? "Optimizing…" : "Run optimization"}</span>
+              </span>
+            </button>
+            <button
+              type="button"
+              disabled={!activeBackendSession}
+              title="Cancel queued/running backend optimization session."
+              onClick={() => {
+                const sessionId = activeBackendSession?.id ?? activeLabJobIdRef.current;
+                if (!sessionId) return;
+                void fetch(`/api/lab/sessions/${encodeURIComponent(sessionId)}`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ action: "cancel" }),
+                }).finally(() => {
+                  clearActiveLabJobIfId(sessionId);
+                });
+              }}
+              className="pointer-events-auto rounded-md border border-red-900/50 bg-red-950/40 px-3 py-1 text-xs text-red-100 hover:bg-red-950/70 disabled:opacity-40"
+            >
+              Stop
+            </button>
+          </div>
+          <div className="mt-1.5 flex flex-wrap items-end gap-2">
+            <label className="text-[10px] text-[var(--muted)]">
             <span className="inline-flex items-center gap-0.5">
               Continue for (generations)
               <ParamHelp text="Runs another segment of the genetic search starting from the best gene vector from your last completed optimization (same metric, cohort, and axes). Evaluation # and generation # continue from where you left off. Change optimized axes or cohort between runs only if you accept that stored genes may no longer match." />
@@ -738,77 +1234,108 @@ export function OptimizationPanel(props: {
                 setContinueGenerations(Math.max(1, Math.min(500, parseInt(e.target.value, 10) || 1)))
               }
             />
-          </label>
-          <button
-            type="button"
-            disabled={continueDisabled}
-            onClick={() => void runOptimization("continue")}
-            className="rounded-md border border-amber-800/60 bg-amber-950/50 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-900/40 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            Continue optimization
-          </button>
-          {!resumeMatchesAxes && resumeGeneCount != null ? (
-            <span className="text-[10px] text-amber-100/85">
-              Resume genes ({resumeGeneCount} dims) don&apos;t match selected axes ({axisIds.length}). Run a fresh search or
-              restore axes.
-            </span>
-          ) : null}
-          {continueOverBudget ? (
-            <span className="text-[10px] text-amber-100/85">
-              Continue segment ({continueEvalBudget.toLocaleString("en-US")} evals) exceeds max eval budget.
-            </span>
-          ) : null}
+            </label>
+            <button
+              type="button"
+              disabled={continueDisabled}
+              onClick={() => void runOptimization("continue")}
+              className="rounded-md border border-amber-800/60 bg-amber-950/50 px-3 py-1 text-xs font-medium text-amber-100 hover:bg-amber-900/40 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Continue optimization
+            </button>
+            {!resumeMatchesAxes && resumeGeneCount != null ? (
+              <span className="text-[10px] text-amber-100/85">
+                Resume genes ({resumeGeneCount} dims) don&apos;t match selected axes ({axisIds.length}). Run a fresh search
+                or restore axes.
+              </span>
+            ) : null}
+            {continueOverBudget ? (
+              <span className="text-[10px] text-amber-100/85">
+                Continue segment ({continueEvalBudget.toLocaleString("en-US")} evals) exceeds max eval budget.
+              </span>
+            ) : null}
+          </div>
         </div>
 
-        {running ? (
+        {running || hydratedLive ? (
           <div
-            className="space-y-2 rounded-lg border border-sky-900/40 bg-[#0a1018] px-2.5 py-2 font-mono-n text-[10px]"
-            data-ui-tick={uiClock}
+            className="space-y-1.5 rounded-lg border border-sky-900/40 bg-[#0a1018] px-2 py-1.5 font-mono-n text-[10px]"
           >
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
               <span className="font-semibold text-sky-100/95">Live progress</span>
-              <ParamHelp text="Trials run strictly one after another via the Rust/WASM heuristic engine. Stop applies between evaluations (requestAnimationFrame yield), not mid-WASM-call." />
+              <span className="rounded border border-sky-900/45 bg-sky-950/35 px-1.5 py-0.5 text-[10px] text-sky-100/90">
+                policy: {activePolicyMode === "qre" ? "QRE / softmax" : "Heuristic"}
+              </span>
+              <ParamHelp text="Trials execute in the backend worker process and persist into lab session storage. This panel displays server-side progress snapshots and completed trial rows." />
             </div>
             <p className="leading-snug text-[var(--muted)]">
-              {currentEvalLive ? (
+              {running && currentEvalLive ? (
                 <>
                   <span className="text-[var(--text)]">Now simulating</span> · Gen {currentEvalLive.generation + 1} · eval{" "}
                   <span className="tabular-nums text-sky-200/95">
-                    {currentEvalLive.evaluationNumber}/{segPlan.toLocaleString("en-US")}
+                    {currentEvalLive.evaluationNumber}/{displayPlan.toLocaleString("en-US")}
                   </span>
                   <span className="text-[var(--border)]"> · </span>
                   <span className="break-words text-[11px] text-[var(--text)]">{currentEvalLive.shortLabel}</span>
+                </>
+              ) : hydratedLive ? (
+                <>
+                  <span className="text-[var(--text)]">Resumed live session</span>
+                  {hydratedLive.generation != null ? <> · Gen {hydratedLive.generation + 1}</> : null}
+                  {" · "}
+                  eval{" "}
+                  <span className="tabular-nums text-sky-200/95">
+                    {hydratedLive.evaluations.toLocaleString("en-US")}/{displayPlan.toLocaleString("en-US")}
+                  </span>
+                  <span className="text-[var(--border)]"> · </span>
+                  <span className="text-[11px] text-[var(--text)]">{waitingDiagnostics.message}</span>
                 </>
               ) : (
                 <span className="text-[var(--muted)]">Preparing next evaluation…</span>
               )}
             </p>
             <div className="space-y-1">
-              <div className="h-2 w-full overflow-hidden rounded-full bg-[#1a1a22]">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-[var(--muted)]">
+                <span>Segment evaluations</span>
+                <span className="tabular-nums text-[var(--text)]">
+                  {displayDoneEvals.toLocaleString("en-US")} / {displayPlan.toLocaleString("en-US")}
+                </span>
+              </div>
+              <div
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={displayPlan}
+                aria-valuenow={Math.min(displayDoneEvals, displayPlan)}
+                aria-label={`Optimization segment progress, ${displayDoneEvals} of ${displayPlan} evaluations complete`}
+                className="h-1.5 w-full min-w-0 overflow-hidden rounded-full bg-[#1a1a1f]"
+              >
                 <div
-                  className="h-full rounded-full bg-sky-700/80 transition-[width] duration-300 ease-out"
-                  style={{ width: `${progressPct}%` }}
+                  className="h-full min-w-0 rounded-full bg-emerald-700/80 transition-[width] duration-300 ease-out"
+                  style={{ width: `${displayProgressPct}%` }}
                 />
               </div>
               <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[var(--muted)]">
                 <span>
                   Throughput:{" "}
                   <span className="tabular-nums text-[var(--text)]">
-                    {segmentDoneEvals.toLocaleString("en-US")}/{segPlan.toLocaleString("en-US")}
+                    {displayDoneEvals.toLocaleString("en-US")}/{displayPlan.toLocaleString("en-US")}
                   </span>{" "}
-                  ({progressPct.toFixed(1)}%)
+                  ({displayProgressPct.toFixed(1)}%)
+                  {!running && hydratedLive?.throughputPerSec != null
+                    ? ` · ${hydratedLive.throughputPerSec.toFixed(2)} eval/s`
+                    : ""}
                 </span>
                 <span>
                   Elapsed:{" "}
                   <span className="tabular-nums text-[var(--text)]">
-                    {liveElapsedMs != null ? formatMsClock(liveElapsedMs) : "—"}
+                    {displayElapsedMs != null ? formatMsClock(displayElapsedMs) : "—"}
                   </span>
                 </span>
-                {etaMs != null && Number.isFinite(etaMs) ? (
+                {displayEtaMs != null && Number.isFinite(displayEtaMs) ? (
                   <span title="Average duration × remaining evaluations">
-                    ETA: <span className="tabular-nums text-[var(--text)]">~{formatMsClock(etaMs)}</span>
+                    ETA: <span className="tabular-nums text-[var(--text)]">~{formatMsClock(displayEtaMs)}</span>
                   </span>
-                ) : running && segmentDoneEvals === 0 ? (
+                ) : (running || hydratedLive) && displayDoneEvals === 0 ? (
                   <span className="text-[var(--muted)]">ETA: …</span>
                 ) : null}
                 {curEvalElapsedMs != null ? (
@@ -817,7 +1344,37 @@ export function OptimizationPanel(props: {
                     <span className="tabular-nums text-amber-100/90">{formatMsClock(curEvalElapsedMs)}</span>
                   </span>
                 ) : null}
+                <span>
+                  Last persisted trial:{" "}
+                  <span className="tabular-nums text-[var(--text)]">
+                    {waitingDiagnostics.lastPersistedTrialAt ? formatFinishedAt(waitingDiagnostics.lastPersistedTrialAt) : "—"}
+                  </span>
+                </span>
+                <span>
+                  Since last write:{" "}
+                  <span className="tabular-nums text-[var(--text)]">
+                    {waitingDiagnostics.sinceLastTrialWriteMs != null
+                      ? formatMsClock(waitingDiagnostics.sinceLastTrialWriteMs)
+                      : "—"}
+                  </span>
+                </span>
+                <span>
+                  State:{" "}
+                  <span className="text-[var(--text)]">
+                    {waitingDiagnostics.phase === "evaluating"
+                      ? "evaluating"
+                      : waitingDiagnostics.phase === "waiting_to_persist"
+                        ? "waiting to persist"
+                        : "idle"}
+                  </span>
+                </span>
               </div>
+              {waitingDiagnostics.showLongWaitNote ? (
+                <p className="text-[10px] leading-snug text-sky-100/80">
+                  No new trial persisted for more than 30s. This is often expected while a long simulation tick or heavy candidate
+                  evaluation is still running.
+                </p>
+              ) : null}
             </div>
           </div>
         ) : null}
@@ -831,10 +1388,16 @@ export function OptimizationPanel(props: {
               <>metric {progress.bestMetric.toPrecision(6)}</>
             )}
           </p>
+        ) : hydratedLive?.generation != null ? (
+          <p className="font-mono-n text-[10px] text-[var(--muted)]">
+            Gen {hydratedLive.generation + 1}
+            {hydratedLive.planned != null ? ` · evals ${hydratedLive.evaluations.toLocaleString("en-US")} / ${hydratedLive.planned.toLocaleString("en-US")}` : ` · evals ${hydratedLive.evaluations.toLocaleString("en-US")}`}{" "}
+            · live snapshot
+          </p>
         ) : null}
 
         {result ? (
-          <div className="space-y-1 rounded border border-[var(--border)] bg-[#0c0c10] p-2 text-[11px]">
+          <div className="space-y-1 rounded border border-[var(--border)] bg-[#0c0c10] p-1.5 text-[11px]">
             <div className="text-[10px] text-[var(--muted)]">
               {result.cancelled ? "Stopped early · " : ""}
               {result.objective === "target" && result.rmse != null ? (
@@ -878,38 +1441,25 @@ export function OptimizationPanel(props: {
           </div>
         ) : null}
 
-        {(running || trialRows.length > 0 || leaderCell) && (
-          <div className="space-y-2 rounded-lg border border-[var(--border)] bg-[#0c0c10] px-2.5 py-2">
+        {(running || trialRows.length > 0 || leaderCell || sortedOverviewRows.length > 0) && (
+          <div className="space-y-1.5 rounded-lg border border-[var(--border)] bg-[#0c0c10] px-2 py-1.5">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px]">
               <span className="font-semibold text-[var(--text)]">Trial runs</span>
               <ParamHelp text="One row per finished simulation evaluation (same as grid batch cells). ★ marks the current genetic-algorithm leader on your objective metric. Click a label or Load to replay that run in the main viewer (network, metrics, timeline)." />
               <span className="tabular-nums text-[var(--muted)]">
-                {totalEvalCount > 0 ? (
-                  <>
-                    {trialRows.length < totalEvalCount ? (
-                      <>
-                        Last {trialRows.length.toLocaleString("en-US")} of{" "}
-                        {totalEvalCount.toLocaleString("en-US")} evals (rolling window)
-                      </>
-                    ) : (
-                      <>{totalEvalCount.toLocaleString("en-US")} evals</>
-                    )}
-                  </>
-                ) : (
-                  "No evaluations yet"
-                )}
+                {trialRunsCountText}
               </span>
             </div>
 
             {leaderCell ? (
               <div className="flex flex-wrap items-center gap-2 rounded border border-emerald-900/40 bg-emerald-950/25 px-2 py-1.5 font-mono-n text-[10px]">
                 <span className="font-medium text-emerald-100/95">Current leader</span>
-                <span className="text-[var(--muted)]">{OPTIMIZATION_METRIC_LABELS[metric]}:</span>
+                <span className="text-[var(--muted)]">{OPTIMIZATION_METRIC_LABELS[activeMetric]}:</span>
                 <span className="tabular-nums text-[var(--text)]">
                   {formatOptimizationMetricCell(
-                    metric,
+                    activeMetric,
                     leaderCell.run.history[leaderCell.run.history.length - 1]
-                      ? readOptimizationMetric(leaderCell.run.history[leaderCell.run.history.length - 1]!, metric)
+                      ? readOptimizationMetric(leaderCell.run.history[leaderCell.run.history.length - 1]!, activeMetric)
                       : null,
                   )}
                 </span>
@@ -923,8 +1473,93 @@ export function OptimizationPanel(props: {
               </div>
             ) : null}
 
-            {trialRows.length > 0 ? (
-              <div className="max-h-[min(55vh,480px)] overflow-auto rounded border border-[var(--border)]">
+            {sortedOverviewRows.length > 0 ? (
+              <div className="space-y-1">
+                <div className="text-[10px] font-semibold text-[var(--text)]">Finished runs overview</div>
+                <div className="max-h-[min(40vh,360px)] overflow-auto rounded border border-[var(--border)]">
+                  <table className="w-max min-w-full border-collapse text-left font-mono-n text-[10px]">
+                    <thead className="sticky top-0 z-[5] bg-[#141418] text-[var(--muted)] shadow-[0_1px_0_rgba(0,0,0,0.35)]">
+                      <tr className="border-b border-[var(--border)]">
+                        <th className="p-1.5 text-right">
+                          <button type="button" className="hover:text-[var(--text)]" onClick={() => toggleOverviewSort("generation")}>
+                            Gen{overviewSortKey === "generation" ? (overviewSortDirection === "asc" ? " ↑" : " ↓") : ""}
+                          </button>
+                        </th>
+                        <th className="p-1.5 text-right">
+                          <button type="button" className="hover:text-[var(--text)]" onClick={() => toggleOverviewSort("evaluation")}>
+                            Eval{overviewSortKey === "evaluation" ? (overviewSortDirection === "asc" ? " ↑" : " ↓") : ""}
+                          </button>
+                        </th>
+                        <th className="p-1.5 text-center" title="Best/leader trial">
+                          ★
+                        </th>
+                        <th className="p-1.5 text-right">
+                          <button type="button" className="hover:text-[var(--text)]" onClick={() => toggleOverviewSort("metric")}>
+                            {activeMetric === "innovationFlowPerMeanWealth"
+                              ? "I/W̄"
+                              : OPTIMIZATION_METRIC_LABELS[activeMetric].slice(0, 12)}
+                            {overviewSortKey === "metric" ? (overviewSortDirection === "asc" ? " ↑" : " ↓") : ""}
+                          </button>
+                        </th>
+                        <th className="p-1.5 text-right">
+                          <button type="button" className="hover:text-[var(--text)]" onClick={() => toggleOverviewSort("rmse")}>
+                            RMSE{overviewSortKey === "rmse" ? (overviewSortDirection === "asc" ? " ↑" : " ↓") : ""}
+                          </button>
+                        </th>
+                        <th className="p-1.5 text-left">Status</th>
+                        <th className="p-1.5 text-left">Preview</th>
+                        <th className="p-1.5 text-right">
+                          <button type="button" className="hover:text-[var(--text)]" onClick={() => toggleOverviewSort("duration")}>
+                            Duration{overviewSortKey === "duration" ? (overviewSortDirection === "asc" ? " ↑" : " ↓") : ""}
+                          </button>
+                        </th>
+                        <th className="p-1.5 text-right">
+                          <button type="button" className="hover:text-[var(--text)]" onClick={() => toggleOverviewSort("finishedAt")}>
+                            Finished{overviewSortKey === "finishedAt" ? (overviewSortDirection === "asc" ? " ↑" : " ↓") : ""}
+                          </button>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedOverviewRows.map((row) => {
+                        const previewable = isOptimizationOverviewRowPreviewable(row);
+                        const isBest = isOptimizationOverviewRowBest(row, resolvedBestOverviewRowId);
+                        return (
+                        <tr
+                          key={`overview_${row.id}`}
+                          className={`border-t border-[var(--border)] ${
+                            selectedOverviewRowId === row.id ? "bg-emerald-950/25" : "hover:bg-[#1a1a1f]"
+                          } ${previewable ? "cursor-pointer" : "opacity-70"}`}
+                          onClick={() => handleOverviewRowClick(row.id, row.source, previewable)}
+                        >
+                          <td className="p-1.5 text-right tabular-nums">{row.generation != null ? row.generation + 1 : "—"}</td>
+                          <td className="p-1.5 text-right tabular-nums">{row.evaluationNumber != null ? row.evaluationNumber : "—"}</td>
+                          <td className="p-1.5 text-center text-amber-200/90">{isBest ? "★" : ""}</td>
+                          <td className="p-1.5 text-right tabular-nums">{formatOptimizationMetricCell(activeMetric, row.metricValue)}</td>
+                          <td className="p-1.5 text-right tabular-nums text-[var(--muted)]">
+                            {row.rmse != null ? row.rmse.toPrecision(4) : "—"}
+                          </td>
+                          <td className="p-1.5 text-[var(--accent)]">{row.status}</td>
+                          <td className="p-1.5 text-[var(--muted)]">
+                            {hydratedTrialLoadingId === row.id ? "Loading…" : previewable ? "Click row" : "Unavailable"}
+                          </td>
+                          <td className="p-1.5 text-right tabular-nums text-[var(--muted)]">
+                            {formatOptimizationDurationMs(row.durationMs)}
+                          </td>
+                          <td className="p-1.5 text-right tabular-nums text-[var(--muted)]">
+                            {row.finishedAt ? formatFinishedAt(row.finishedAt) : "—"}
+                          </td>
+                        </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : null}
+
+            {visibleTrialRows.length > 0 ? (
+              <div className="max-h-[min(62vh,560px)] overflow-auto rounded border border-[var(--border)]">
                 <table className="w-max min-w-full border-collapse text-left font-mono-n text-[10px]">
                   <thead className="sticky top-0 z-[5] bg-[#141418] text-[var(--muted)] shadow-[0_1px_0_rgba(0,0,0,0.35)]">
                     <tr className="border-b border-[var(--border)]">
@@ -934,10 +1569,12 @@ export function OptimizationPanel(props: {
                       <th className="p-1.5 text-center" title="Genetic algorithm leader">
                         ★
                       </th>
-                      <th className="min-w-[5rem] p-1.5 text-right" title={OPTIMIZATION_METRIC_LABELS[metric]}>
-                        {metric === "innovationFlowPerMeanWealth" ? "I/W̄" : OPTIMIZATION_METRIC_LABELS[metric].slice(0, 12)}
+                      <th className="min-w-[5rem] p-1.5 text-right" title={OPTIMIZATION_METRIC_LABELS[activeMetric]}>
+                        {activeMetric === "innovationFlowPerMeanWealth"
+                          ? "I/W̄"
+                          : OPTIMIZATION_METRIC_LABELS[activeMetric].slice(0, 12)}
                       </th>
-                      {objective === "target" ? (
+                      {activeObjective === "target" ? (
                         <th className="p-1.5 text-right" title="Root mean squared error vs target">
                           RMSE
                         </th>
@@ -958,8 +1595,7 @@ export function OptimizationPanel(props: {
                     </tr>
                   </thead>
                   <tbody>
-                    {trialRows.map((row, idx) => {
-                      const last = row.cell.run.history[row.cell.run.history.length - 1];
+                    {visibleTrialRows.map((row, idx) => {
                       const isLeader = row.id === leaderRowId;
                       const rmse = objective === "target" ? Math.sqrt(Math.max(0, row.mse)) : NaN;
                       return (
@@ -974,26 +1610,28 @@ export function OptimizationPanel(props: {
                               isLeader ? "bg-emerald-950/30" : "bg-[#0a0a0c]"
                             }`}
                           >
-                            {idx + 1}
+                            {idx + 1 + Math.max(0, trialRows.length - visibleTrialRows.length)}
                           </td>
                           <td className="p-1.5 text-right tabular-nums">{row.generation + 1}</td>
                           <td className="p-1.5 text-right tabular-nums">{row.evaluationNumber}</td>
                           <td className="p-1.5 text-center text-amber-200/90">{isLeader ? "★" : ""}</td>
                           <td className="p-1.5 text-right tabular-nums">
-                            {formatOptimizationMetricCell(metric, row.metricValue)}
+                            {formatOptimizationMetricCell(activeMetric, row.metricValue)}
                           </td>
-                          {objective === "target" ? (
+                          {activeObjective === "target" ? (
                             <td className="p-1.5 text-right tabular-nums text-[var(--muted)]">
                               {Number.isFinite(rmse) ? rmse.toPrecision(4) : "—"}
                             </td>
                           ) : null}
-                          <td className="p-1.5 text-right tabular-nums">{last?.metrics.giniWealth.toFixed(3) ?? "—"}</td>
                           <td className="p-1.5 text-right tabular-nums">
-                            {last ? meanWealthAtTick(last).toFixed(2) : "—"}
+                            {row.giniWealth != null && Number.isFinite(row.giniWealth) ? row.giniWealth.toFixed(3) : "—"}
                           </td>
                           <td className="p-1.5 text-right tabular-nums">
-                            {last && Number.isFinite(innovationFlowPerAgentAtTick(last))
-                              ? innovationFlowPerAgentAtTick(last).toFixed(6)
+                            {row.meanWealth != null && Number.isFinite(row.meanWealth) ? row.meanWealth.toFixed(2) : "—"}
+                          </td>
+                          <td className="p-1.5 text-right tabular-nums">
+                            {row.innovationPerAgent != null && Number.isFinite(row.innovationPerAgent)
+                              ? row.innovationPerAgent.toFixed(6)
                               : "—"}
                           </td>
                           <td className="p-1.5 text-right tabular-nums text-[var(--muted)]">
@@ -1003,8 +1641,19 @@ export function OptimizationPanel(props: {
                             <button
                               type="button"
                               className="max-w-full truncate text-left text-[var(--accent)] hover:underline"
-                              title={row.cell.label}
-                              onClick={() => loadTrialCell(row.cell)}
+                              title={row.label}
+                              onClick={() => {
+                                if (row.previewRun) {
+                                  loadTrialCell({
+                                    id: row.id,
+                                    label: `Opt · ${row.label}`,
+                                    assignments: [],
+                                    run: row.previewRun,
+                                  });
+                                  return;
+                                }
+                                void loadHydratedTrialById(row.id);
+                              }}
                             >
                               {row.label}
                             </button>
@@ -1017,6 +1666,11 @@ export function OptimizationPanel(props: {
               </div>
             ) : running ? (
               <p className="text-[10px] text-[var(--muted)]">Evaluations appear here as they finish…</p>
+            ) : null}
+            {running && trialRows.length > visibleTrialRows.length ? (
+              <p className="text-[10px] text-[var(--muted)]">
+                Rendering last {visibleTrialRows.length.toLocaleString("en-US")} rows live to keep UI responsive.
+              </p>
             ) : null}
           </div>
         )}

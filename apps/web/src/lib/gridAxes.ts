@@ -868,6 +868,16 @@ const META = {
     category: "IP policy",
     sweep: { kind: "linear", min: 0, max: 1 },
   },
+  "policy.litigationCostMultiplier": {
+    label: "Litigation cost multiplier",
+    short: "lit",
+    category: "IP policy",
+    sweep: { kind: "linear", min: 0.5, max: 2 },
+    customSample: (steps: number, b: SimConfig) => {
+      const x = b.policy.litigationCostMultiplier;
+      return linspace(Math.max(0.25, x * 0.5), Math.min(3, x * 1.5), steps);
+    },
+  },
   "regulatory.enabled": {
     label: "Regulatory pressure enabled",
     short: "rOn",
@@ -954,6 +964,26 @@ const META = {
     category: "Innovation & decay",
     sweep: { kind: "linear", min: 0, max: 0.2 },
   },
+  capabilityBeta: {
+    label: "Capability β (market kernel)",
+    short: "βcap",
+    category: "Market / spillovers",
+    sweep: { kind: "linear", min: 0.2, max: 0.95 },
+    customSample: (steps: number, b: SimConfig) => {
+      const x = b.capabilityBeta;
+      return linspace(Math.max(0.15, x * 0.85), Math.min(0.98, x * 1.12), steps);
+    },
+  },
+  spilloverAlpha: {
+    label: "Spillover α",
+    short: "αsp",
+    category: "Market / spillovers",
+    sweep: { kind: "linear", min: 0.05, max: 0.6 },
+    customSample: (steps: number, b: SimConfig) => {
+      const x = b.spilloverAlpha;
+      return linspace(Math.max(0.02, x * 0.75), Math.min(0.75, x * 1.25), steps);
+    },
+  },
   "ui.policyMode": {
     label: "Policy mode (batch)",
     short: "pol",
@@ -994,6 +1024,8 @@ const GRID_AXIS_DESCRIPTIONS: Record<GridAxisId, string> = {
     "Regulatory pressure for reproducibility and openness—raises spillover benefits when findings are published openly.",
   "policy.regulatoryAmbition":
     "Baseline strictness target for harm mitigation when the externality/regulation module is active.",
+  "policy.litigationCostMultiplier":
+    "Scales wealth spent on enforcement-style IP actions when overlapping patents exist—higher makes disputes costlier.",
   "regulatory.enabled":
     "Turns the externality channel on or off: offerings map into social loads, transfers, and mitigation each tick.",
   "regulatory.ruleMode":
@@ -1013,6 +1045,10 @@ const GRID_AXIS_DESCRIPTIONS: Record<GridAxisId, string> = {
     "Integer ticks between committing R&D and receiving knowledge payoffs—pipeline lag in the innovation loop.",
   wealthDepreciationRate: "Multiplicative wealth loss each tick (maintenance/consumption style decay).",
   knowledgeDepreciationRate: "Knowledge stock lost to obsolescence or forgetting each tick.",
+  capabilityBeta:
+    "Capability weight in the competitive market kernel—how strongly knowledge translates into contestable demand.",
+  spilloverAlpha:
+    "Spillover absorption into neighbor knowledge stocks via the market adjacency structure.",
   "ui.policyMode":
     "Per-cell decision rule for the batch only: fast heuristic vs softmax QRE sampling (does not enable LLM batches).",
   "manifest.qreTemperature":
@@ -1114,6 +1150,11 @@ export function applyGridAxisValue(
       return { ...cfg, policy: { ...cfg.policy, dataSharingMandateStrength: clamp(n, 0, 1) } };
     case "policy.regulatoryAmbition":
       return { ...cfg, policy: { ...cfg.policy, regulatoryAmbition: clamp(n, 0, 1) } };
+    case "policy.litigationCostMultiplier":
+      return {
+        ...cfg,
+        policy: { ...cfg.policy, litigationCostMultiplier: Math.max(0.05, n) },
+      };
     case "regulatory.enabled":
       return {
         ...cfg,
@@ -1148,6 +1189,10 @@ export function applyGridAxisValue(
       return { ...cfg, wealthDepreciationRate: clamp(n, 0, 1) };
     case "knowledgeDepreciationRate":
       return { ...cfg, knowledgeDepreciationRate: clamp(n, 0, 1) };
+    case "capabilityBeta":
+      return { ...cfg, capabilityBeta: clamp(n, 0.05, 0.99) };
+    case "spilloverAlpha":
+      return { ...cfg, spilloverAlpha: clamp(n, 0.01, 0.95) };
     default: {
       const _x: never = id;
       return _x;

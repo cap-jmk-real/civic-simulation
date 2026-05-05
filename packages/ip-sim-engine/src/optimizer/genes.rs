@@ -35,6 +35,26 @@ fn lerp_u(u: f64, lo: f64, hi: f64) -> f64 {
     lo + t * (hi - lo)
 }
 
+/// Map a browser-style axis id (or `GeneAxis` debug name) to [`GeneAxis`].
+/// Accepts keys like `policy.enforcementIntensity`, `capabilityBeta`, and enum-style names.
+pub fn parse_gene_axis_id(s: &str) -> Result<GeneAxis, String> {
+    match s.trim() {
+        "policy.enforcementIntensity" | "EnforcementIntensity" => Ok(GeneAxis::EnforcementIntensity),
+        "policy.openScienceSubsidy" | "OpenScienceSubsidy" => Ok(GeneAxis::OpenScienceSubsidy),
+        "policy.dataSharingMandateStrength" | "DataSharingMandateStrength" => {
+            Ok(GeneAxis::DataSharingMandateStrength)
+        }
+        "policy.regulatoryAmbition" | "RegulatoryAmbition" => Ok(GeneAxis::RegulatoryAmbition),
+        "policy.patentDurationTicks" | "PatentDurationTicks" => Ok(GeneAxis::PatentDurationTicks),
+        "policy.litigationCostMultiplier" | "LitigationCostMultiplier" => {
+            Ok(GeneAxis::LitigationCostMultiplier)
+        }
+        "capabilityBeta" | "CapabilityBeta" => Ok(GeneAxis::CapabilityBeta),
+        "spilloverAlpha" | "SpilloverAlpha" => Ok(GeneAxis::SpilloverAlpha),
+        other => Err(format!("unknown or unsupported genetic axis: {other}")),
+    }
+}
+
 /// Apply `genes` to a **clone** of `base` in axis order; does not borrow `genes` after return.
 pub fn apply_genes_to_config(base: &SimConfig, axes: &[GeneAxis], genes: &[f64]) -> SimConfig {
     let mut c = base.clone();

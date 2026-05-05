@@ -47,6 +47,25 @@ import { hamiltonAllocateCountsFromWeights } from "@/lib/percentPopulation";
 import { formatMachineHintsOneLine } from "@/lib/machineResourceHints";
 import { useMachineResourceHints } from "@/lib/useMachineResourceHints";
 import type { GridCellResult } from "@/lib/gridBatchTypes";
+import {
+  clearActiveLabJob,
+  clearActiveLabJobIfId,
+  getLabTabId,
+  isGridProgress,
+  LAB_JOB_HEARTBEAT_MS,
+  newLabJobId,
+  patchActiveLabJob,
+  readActiveLabJob,
+  setActiveLabJob,
+  subscribeLabJobs,
+} from "@/lib/labJobStore";
+import {
+  buildCompactRunSummaryJson,
+  optionalFullRunJsonUnderCap,
+  persistLabBatchCell,
+  persistLabSessionComplete,
+  persistLabSessionCreate,
+} from "@/lib/labPersistenceClient";
 
 export type { GridCellResult };
 
@@ -136,11 +155,23 @@ export function BatchGridPanel(props: {
   onBatchFinished?: (
     results: GridCellResult[],
     meta: {
+      sessionId: string | null;
+      cancelled: boolean;
       gridConstruction: GridConstructionMode;
       constructionLabel: string;
       levelProductLabel: string;
     },
   ) => void;
+  /** True while this panel is executing a batch (for cross-panel durable job UX). */
+  onLabJobRunnerChange?: (active: boolean) => void;
+  onSessionStarted?: (meta: {
+    sessionId: string;
+    gridConstruction: GridConstructionMode;
+    constructionLabel: string;
+    levelProductLabel: string;
+  }) => void;
+  /** Linked to analysis project for SQLite `lab_sessions.project_id` (optional). */
+  persistenceProjectId?: string | null;
 }) {
   const [axisTable, setAxisTable] = useState<Record<GridAxisId, AxisTableRow>>(() =>
     buildAxisTableState(props.baseConfig),
@@ -160,7 +191,9 @@ export function BatchGridPanel(props: {
   const [running, setRunning] = useState(false);
   /** Set from “Stop batch”; read between simulations (current cell still finishes). */
   const batchCancelRequestedRef = useRef(false);
+  const activeLabJobIdRef = useRef<string | null>(null);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [, labJobUiBump] = useState(0);
   const [results, setResults] = useState<GridCellResult[]>([]);
   /** Last run: first two enabled axes (definition order) for 2D heatmap indexing. */
   const [gridShape, setGridShape] = useState<{
@@ -193,6 +226,28 @@ export function BatchGridPanel(props: {
   );
 
   const machineHints = useMachineResourceHints();
+
+  useEffect(() => {
+    props.onLabJobRunnerChange?.(running);
+  }, [running, props.onLabJobRunnerChange]);
+
+  useEffect(() => subscribeLabJobs(() => labJobUiBump((n) => n + 1)), []);
+
+  useEffect(() => {
+    if (!running) return;
+    const id = activeLabJobIdRef.current;
+    if (!id) return;
+    const t = window.setInterval(() => patchActiveLabJob(id, {}), LAB_JOB_HEARTBEAT_MS);
+    return () => window.clearInterval(t);
+  }, [running]);
+
+  const interruptedGridJob = (() => {
+    const j = readActiveLabJob();
+    if (!j || j.status !== "running" || j.type !== "grid") return null;
+    if (j.ownerTabId !== getLabTabId()) return null;
+    if (running) return null;
+    return j;
+  })();
 
   const sidebarTotal = useMemo(
     () => totalAgents(props.baseConfig.agentCounts),
@@ -478,9 +533,12 @@ export function BatchGridPanel(props: {
 
   const onBatchFinished = props.onBatchFinished;
   const prevRunningRef = useRef(false);
+  const lastSessionMetaRef = useRef<{ id: string; cancelled: boolean } | null>(null);
   useEffect(() => {
     if (prevRunningRef.current && !running) {
       onBatchFinished?.(results, {
+        sessionId: lastSessionMetaRef.current?.id ?? null,
+        cancelled: Boolean(lastSessionMetaRef.current?.cancelled),
         gridConstruction,
         constructionLabel: GRID_CONSTRUCTION_LABELS[gridConstruction],
         levelProductLabel,
@@ -612,10 +670,50 @@ export function BatchGridPanel(props: {
     }
 
     const out: GridCellResult[] = [];
+    const jobId = newLabJobId();
+    lastSessionMetaRef.current = { id: jobId, cancelled: false };
+    props.onSessionStarted?.({
+      sessionId: jobId,
+      gridConstruction,
+      constructionLabel: GRID_CONSTRUCTION_LABELS[gridConstruction],
+      levelProductLabel,
+    });
+    activeLabJobIdRef.current = jobId;
+    void persistLabSessionCreate({
+      id: jobId,
+      sessionType: "grid_batch",
+      projectId: props.persistenceProjectId ?? null,
+      meta: {
+        label: GRID_CONSTRUCTION_LABELS[gridConstruction],
+        gridConstruction,
+        levelProductLabel,
+        plannedTotalRuns,
+        runnableTotal: totalRuns,
+        maxRunsUserCap,
+        maxAgentsCap: maxAgentsCap ?? null,
+        plannedGridN,
+        baseSeed: props.baseConfig.seed,
+        mode: props.mode,
+        qreTemp: props.qreTemp,
+        enabledAxisIds,
+      },
+    });
+    setActiveLabJob({
+      id: jobId,
+      type: "grid",
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      status: "running",
+      label: `Grid · ${GRID_CONSTRUCTION_LABELS[gridConstruction]}`,
+      progress: { done: 0, total: totalRuns },
+      ownerTabId: getLabTabId(),
+      payload: { gridConstruction },
+    });
     setRunning(true);
     batchCancelRequestedRef.current = false;
     setProgress({ done: 0, total: totalRuns });
     const manifest0 = defaultCellManifest(props.mode, props.qreTemp);
+    let completedAllCells = false;
 
     try {
       for (let idx = 0; idx < assignments.length; idx++) {
@@ -656,23 +754,48 @@ export function BatchGridPanel(props: {
         const nHint = cellN !== plannedGridN ? ` · N=${cellN}` : "";
         const id = `g${idx}_${combo.map((c: GridAxisAssignment) => `${c.id}:${formatAxisCellValue(c.value)}`).join("_")}`;
 
-        out.push({
+        const cellResult: GridCellResult = {
           id,
           label: `${labelParts.join(" · ")}${nHint}`,
           assignments: combo,
           run: result,
+        };
+        out.push(cellResult);
+        void persistLabBatchCell({
+          sessionId: jobId,
+          rowId: id,
+          cellIndex: idx,
+          cellClientId: id,
+          label: cellResult.label,
+          assignments: combo,
+          runSummaryJson: buildCompactRunSummaryJson(result),
+          fullRunJson: optionalFullRunJsonUnderCap(result),
         });
         setProgress({ done: idx + 1, total: totalRuns });
+        patchActiveLabJob(jobId, { progress: { done: idx + 1, total: totalRuns } });
         setResults([...out]);
         await new Promise((r) => setTimeout(r, 0));
       }
+      completedAllCells = !batchCancelRequestedRef.current && out.length === assignments.length;
     } finally {
+      if (lastSessionMetaRef.current?.id === jobId) {
+        lastSessionMetaRef.current = { id: jobId, cancelled: !completedAllCells };
+      }
       batchCancelRequestedRef.current = false;
+      const jid = activeLabJobIdRef.current;
+      activeLabJobIdRef.current = null;
+      if (jid) {
+        void persistLabSessionComplete({
+          sessionId: jid,
+          status: completedAllCells ? "complete" : "cancelled",
+        });
+        clearActiveLabJobIfId(jid);
+      }
       setRunning(false);
     }
   }, [
     effectiveRunPlan,
-    enabledAxisIds.length,
+    enabledAxisIds,
     gridConstruction,
     heatmapDisabledByAgentFilter,
     levelProductLabel,
@@ -684,6 +807,7 @@ export function BatchGridPanel(props: {
     plannedGridN,
     props.mode,
     props.qreTemp,
+    props.persistenceProjectId,
   ]);
 
   const heatmapData = useMemo(() => {
@@ -754,6 +878,31 @@ export function BatchGridPanel(props: {
           <ParamHelp text="The batch loop awaits each run before starting the next. Parallelism would require explicit Web Workers or WASM with threads and a matching host API; that is not part of BatchGridPanel today." />
         </p>
       </header>
+
+      {interruptedGridJob ? (
+        <div
+          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-900/55 bg-amber-950/30 px-3 py-2 text-[11px] text-amber-100"
+          role="status"
+        >
+          <span>
+            <span className="font-medium">Previous grid batch interrupted</span>
+            {isGridProgress(interruptedGridJob.progress) ? (
+              <span className="text-amber-100/85">
+                {" "}
+                · last progress {interruptedGridJob.progress.done.toLocaleString("en-US")} /{" "}
+                {interruptedGridJob.progress.total.toLocaleString("en-US")} cells (reload stops the batch loop).
+              </span>
+            ) : null}
+          </span>
+          <button
+            type="button"
+            className="shrink-0 rounded border border-zinc-600 px-2 py-0.5 text-[10px] text-zinc-200 hover:bg-zinc-800/80"
+            onClick={() => clearActiveLabJob()}
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
 
       <details
         open={axesPanelOpen}
@@ -1301,6 +1450,7 @@ export function BatchGridPanel(props: {
           <button
             type="button"
             disabled={runButtonDisabled}
+            aria-busy={running}
             title={
               running
                 ? `Running ${progress.done} / ${progress.total}`
@@ -1309,9 +1459,19 @@ export function BatchGridPanel(props: {
             onClick={() => void runGrid()}
             className="min-w-0 flex-1 rounded-md bg-zinc-700 px-3 py-2 text-xs font-medium text-white hover:bg-zinc-600 disabled:cursor-not-allowed disabled:bg-zinc-800/90 disabled:text-zinc-400 disabled:hover:bg-zinc-800/90"
           >
-            {running
-              ? `Grid ${progress.done}/${progress.total}…`
-              : `Run grid · ${plannedSimsAfterAgentCap.toLocaleString("en-US")} sims`}
+            <span className="inline-flex items-center gap-1.5">
+              {running ? (
+                <span
+                  className="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent"
+                  aria-hidden="true"
+                />
+              ) : null}
+              <span>
+                {running
+                  ? `Grid ${progress.done}/${progress.total}…`
+                  : `Run grid · ${plannedSimsAfterAgentCap.toLocaleString("en-US")} sims`}
+              </span>
+            </span>
           </button>
           <button
             type="button"
@@ -1330,6 +1490,31 @@ export function BatchGridPanel(props: {
           </button>
           <ParamHelp text="Full factorial: Cartesian product of per-axis levels. Random/LHS/OAT: ordered list of design points. Heatmap only for full factorial with exactly two axes and a rectangular runnable set. Stop batch halts before the next cell; the in-flight simulation still completes." />
         </div>
+        {running && progress.total > 0 ? (
+          <div className="min-w-0 space-y-1" aria-live="polite">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-[var(--muted)]">
+              <span>Grid batch progress</span>
+              <span className="tabular-nums text-[var(--text)]">
+                {progress.done.toLocaleString("en-US")} / {progress.total.toLocaleString("en-US")}
+              </span>
+            </div>
+            <div
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={progress.total}
+              aria-valuenow={progress.done}
+              aria-label={`Grid batch progress, ${progress.done} of ${progress.total} simulations complete`}
+              className="h-1.5 w-full min-w-0 overflow-hidden rounded-full bg-[#1a1a1f]"
+            >
+              <div
+                className="h-full min-w-0 rounded-full bg-emerald-700/80 transition-[width] duration-200 ease-out"
+                style={{
+                  width: `${progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : 0}%`,
+                }}
+              />
+            </div>
+          </div>
+        ) : null}
         {!running && runBlockReason ? (
           <p className="flex flex-wrap items-center gap-1 text-[10px] leading-snug text-amber-100/90">
             <span>{runBlockReason}</span>

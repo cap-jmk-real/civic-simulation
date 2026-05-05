@@ -2,16 +2,38 @@
   "name": "agent-based-ip-modelling",
   "private": true,
   "packageManager": "pnpm@9.14.2",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
   "scripts": {
+    "preinstall": "node scripts/enforce-pnpm.mjs",
+    "postinstall": "node scripts/setup-native-modules.mjs",
+    "env:check": "node scripts/runtime-context.mjs",
+    "setup:native": "node scripts/setup-native-modules.mjs",
+    "doctor:native": "node scripts/setup-native-modules.mjs --doctor",
+    "guard:native": "node scripts/setup-native-modules.mjs --guard",
     "build": "pnpm -r build",
+    "predev": "pnpm env:check && pnpm guard:native",
     "dev": "pnpm --filter web dev",
+    "dev:all": "node scripts/dev-all.mjs",
     "lint": "pnpm --filter web lint",
+    "pretest": "pnpm env:check",
     "test": "pnpm --filter @ip-sim/core test",
+    "pretest:web": "pnpm env:check",
+    "test:web": "pnpm --filter web test",
+    "pretest:all": "pnpm env:check",
+    "test:all": "pnpm -r --if-present --filter \"./apps/**\" --filter \"./packages/**\" test",
+    "vitest:web": "pnpm --filter web exec vitest",
     "test:coverage": "pnpm --filter @ip-sim/core test:coverage",
     "rust:test": "cargo test --manifest-path packages/ip-sim-engine/Cargo.toml",
     "rust:coverage": "cargo tarpaulin --manifest-path packages/ip-sim-engine/Cargo.toml --lib --tests --engine llvm --timeout 120 --out Stdout",
     "rust:build": "cargo build --release --manifest-path packages/ip-sim-engine/Cargo.toml",
     "rust:bench": "cargo run --release --example bench_market_150k --manifest-path packages/ip-sim-engine/Cargo.toml",
-    "wasm:build": "wasm-pack build packages/ip-sim-wasm --target bundler --out-dir pkg"
+    "wasm:build": "wasm-pack build packages/ip-sim-wasm --target bundler --out-dir pkg",
+    "presim:worker": "pnpm guard:native",
+    "sim:worker": "pnpm --filter web sim:worker"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
   }
 }

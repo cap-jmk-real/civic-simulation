@@ -13,3 +13,6 @@ packages/ip-sim-wasm/target
 
 # Test coverage output
 packages/sim-core/coverage
+
+# Local simulation job queue (SQLite + large JSON spillover)
+apps/web/data/

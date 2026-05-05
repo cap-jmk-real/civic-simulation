@@ -1,4 +1,7 @@
 import {
+  qrePolicy,
+  runSimulationSync,
+  type AgentState,
   type SimConfig,
   type SimulationRun,
   type TickRecord,
@@ -107,6 +110,7 @@ export function genesToAssignments(
 
 /** `target`: minimize (metric − target)². `maximize`: maximize terminal metric (same GA minimizes transformed fitness). */
 export type OptimizationObjective = "target" | "maximize";
+export type OptimizationPolicyMode = "heuristic" | "qre";
 
 /** One completed simulation evaluation inside `runEvolutionarySearch` (for UI tables / replay). */
 export type EvolutionaryEvaluationPayload = {
@@ -132,6 +136,7 @@ export type EvolutionaryEvaluationBeginPayload = {
 export type EvolutionarySearchParams = {
   baseConfig: SimConfig;
   mode: "heuristic" | "qre" | "llm";
+  policyMode?: OptimizationPolicyMode;
   qreTemp: number;
   axisIds: readonly GridAxisId[];
   metric: OptimizationMetricKey;
@@ -228,24 +233,27 @@ async function evaluateFitness(
   genes: number[],
   axisIds: readonly GridAxisId[],
   base: SimConfig,
-  mode: "heuristic" | "qre" | "llm",
+  policyMode: OptimizationPolicyMode,
   qreTemp: number,
   metric: OptimizationMetricKey,
   target: number,
   objective: OptimizationObjective,
   maxAgentsCap: number | null | undefined,
 ): Promise<{ mse: number; run: SimulationRun & { finalWorld?: WorldState } }> {
-  if (mode === "llm" || mode === "qre") {
-    return { mse: Number.POSITIVE_INFINITY, run: {} as SimulationRun & { finalWorld?: WorldState } };
-  }
-
   const assignments = genesToAssignments(genes, axisIds, base);
-  const manifest0 = defaultCellManifest(mode, qreTemp);
+  /** Baseline manifest follows optimize policy; axis overrides (e.g. `ui.policyMode`) can still patch it. */
+  const manifest0 = defaultCellManifest(policyMode, qreTemp);
   let { config: cfg, manifest } = applyMultipleAxesToCell(base, manifest0, assignments);
 
   if (maxAgentsCap != null) {
     if (totalAgents(cfg.agentCounts) > maxAgentsCap) {
-      return { mse: Number.POSITIVE_INFINITY, run: {} as SimulationRun & { finalWorld?: WorldState } };
+      return {
+        mse: Number.POSITIVE_INFINITY,
+        run: {
+          manifest: { ...manifest, seed: cfg.seed, config: cfg } as SimulationRun["manifest"],
+          history: [],
+        } as SimulationRun & { finalWorld?: WorldState },
+      };
     }
     cfg = {
       ...cfg,
@@ -253,11 +261,23 @@ async function evaluateFitness(
     };
   }
 
-  if (manifest.policyMode !== "heuristic") {
-    return { mse: Number.POSITIVE_INFINITY, run: {} as SimulationRun & { finalWorld?: WorldState } };
+  let run: SimulationRun & { finalWorld?: WorldState };
+  if (manifest.policyMode === "qre") {
+    run = runSimulationSync({
+      config: cfg,
+      manifest: {
+        policyMode: "qre",
+        qreTemperature: manifest.qreTemperature,
+      },
+      decide: (world: WorldState, agent: AgentState) =>
+        qrePolicy(agent, world, {
+          temperature: manifest.qreTemperature,
+          seedSalt: cfg.seed,
+        }),
+    }) as SimulationRun & { finalWorld?: WorldState };
+  } else {
+    run = await runSimulationHeuristicWasm(cfg);
   }
-
-  const run = await runSimulationHeuristicWasm(cfg);
 
   const last = run.history[run.history.length - 1];
   if (!last) return { mse: Number.POSITIVE_INFINITY, run };
@@ -279,6 +299,7 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
   const {
     baseConfig,
     mode,
+    policyMode = mode === "qre" ? "qre" : "heuristic",
     qreTemp,
     axisIds,
     metric,
@@ -297,6 +318,10 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
     evaluationNumberOffset = 0,
     generationDisplayOffset = 0,
   } = params;
+  if (mode === "llm") {
+    throw new Error("Optimization does not support LLM policy mode.");
+  }
+
 
   const n = axisIds.length;
   const resume =
@@ -309,6 +334,7 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
       axisIds.length * 997 ^
       (resume ? 0x51ce_a11e : 0)) >>>
     0;
+
   const rng = mulberry32(rngSeed);
 
   let population: number[][];
@@ -359,7 +385,7 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
         genes,
         axisIds,
         baseConfig,
-        mode,
+        policyMode,
         qreTemp,
         metric,
         target,
@@ -376,21 +402,24 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
           run,
         };
       }
-      const last = run.history?.[run.history.length - 1];
+      const history = Array.isArray(run.history) ? run.history : [];
+      const last = history.length > 0 ? history[history.length - 1] : undefined;
       let metricValue: number | null = null;
       if (last) {
         const v = readOptimizationMetric(last, metric);
         metricValue = Number.isFinite(v) ? v : null;
       }
-      onEvaluation?.({
-        generation: generation + generationDisplayOffset,
-        evaluationNumber: evaluationNumberOffset + evaluations,
-        mse,
-        metricValue,
-        assignments,
-        run,
-        isNewBest,
-      });
+      if (history.length > 0) {
+        onEvaluation?.({
+          generation: generation + generationDisplayOffset,
+          evaluationNumber: evaluationNumberOffset + evaluations,
+          mse,
+          metricValue,
+          assignments,
+          run,
+          isNewBest,
+        });
+      }
       scored.push({ genes, mse });
       if (yieldToUi) await yieldToUi();
     }
@@ -441,7 +470,7 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
       bestEver.genes,
       axisIds,
       baseConfig,
-      mode,
+      policyMode,
       qreTemp,
       metric,
       target,
@@ -452,21 +481,24 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
     bestEver.run = fallback.run;
     bestEver.mse = fallback.mse;
     bestEver.assignments = fbAssignments;
-    const lastFb = fallback.run.history[fallback.run.history.length - 1];
+    const fallbackHistory = Array.isArray(fallback.run.history) ? fallback.run.history : [];
+    const lastFb = fallbackHistory.length > 0 ? fallbackHistory[fallbackHistory.length - 1] : undefined;
     let metricValueFb: number | null = null;
     if (lastFb) {
       const v = readOptimizationMetric(lastFb, metric);
       metricValueFb = Number.isFinite(v) ? v : null;
     }
-    onEvaluation?.({
-      generation: genIdx + generationDisplayOffset,
-      evaluationNumber: evaluationNumberOffset + evaluations,
-      mse: fallback.mse,
-      metricValue: metricValueFb,
-      assignments: fbAssignments,
-      run: fallback.run,
-      isNewBest: true,
-    });
+    if (fallbackHistory.length > 0) {
+      onEvaluation?.({
+        generation: genIdx + generationDisplayOffset,
+        evaluationNumber: evaluationNumberOffset + evaluations,
+        mse: fallback.mse,
+        metricValue: metricValueFb,
+        assignments: fbAssignments,
+        run: fallback.run,
+        isNewBest: true,
+      });
+    }
   }
 
   return {

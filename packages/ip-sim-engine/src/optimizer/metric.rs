@@ -13,6 +13,20 @@ pub enum OptimizationMetric {
     InnovationFlowPerMeanWealth,
 }
 
+/// Parse names aligned with web `OptimizationMetricKey` and [`read_optimization_metric`].
+pub fn optimization_metric_from_key(s: &str) -> Result<OptimizationMetric, String> {
+    match s {
+        "giniWealth" => Ok(OptimizationMetric::GiniWealth),
+        "meanWealth" => Ok(OptimizationMetric::MeanWealth),
+        "innovationFlow" => Ok(OptimizationMetric::InnovationFlow),
+        "innovationFlowPerAgent" => Ok(OptimizationMetric::InnovationFlowPerAgent),
+        "totalWealth" => Ok(OptimizationMetric::TotalWealth),
+        "top10WealthShare" => Ok(OptimizationMetric::Top10WealthShare),
+        "innovationFlowPerMeanWealth" => Ok(OptimizationMetric::InnovationFlowPerMeanWealth),
+        _ => Err(format!("unknown optimization metric: {s}")),
+    }
+}
+
 pub fn read_optimization_metric(m: &TickMetrics, key: OptimizationMetric) -> f64 {
     match key {
         OptimizationMetric::GiniWealth => m.gini_wealth,
