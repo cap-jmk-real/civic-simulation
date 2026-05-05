@@ -1,8 +1,33 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import Database from "better-sqlite3";
+import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { makeOptimizationTrialId } from "./optimizationIds";
+
+const require = createRequire(import.meta.url);
+
+function hasNativeSqlite(): boolean {
+  try {
+    const mod = require("better-sqlite3") as { default?: unknown } | ((p: string) => unknown);
+    const DatabaseCtor = (mod as { default?: unknown }).default ?? mod;
+    const db = new (DatabaseCtor as new (p: string) => { close: () => void })(":memory:");
+    db.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const describeSqlite = hasNativeSqlite() ? describe : describe.skip;
+
+function openRawDb(dbPath: string) {
+  const mod = require("better-sqlite3") as { default?: unknown } | ((p: string) => unknown);
+  const DatabaseCtor = (mod as { default?: unknown }).default ?? mod;
+  return new (DatabaseCtor as new (p: string) => { exec: (s: string) => void; prepare: (s: string) => { run: (...args: unknown[]) => void }; close: () => void })(
+    dbPath,
+  );
+}
 
 async function withFreshQueueDb(dbPath: string, fn: () => Promise<void>) {
   process.env.SIM_QUEUE_DB_PATH = dbPath;
@@ -17,7 +42,7 @@ async function withFreshQueueDb(dbPath: string, fn: () => Promise<void>) {
   }
 }
 
-describe("labSessionsStore / sim queue SQLite", () => {
+describeSqlite("labSessionsStore / sim queue SQLite", () => {
   afterEach(() => {
     vi.resetModules();
     delete process.env.SIM_QUEUE_DB_PATH;
@@ -36,7 +61,7 @@ describe("labSessionsStore / sim queue SQLite", () => {
   it("migrates legacy lab_sessions rows missing meta_json / project_id / best_trial_id", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "ip-web-simqueue-"));
     const dbPath = path.join(root, "legacy.db");
-    const raw = new Database(dbPath);
+    const raw = openRawDb(dbPath);
     raw.exec(`
       CREATE TABLE lab_sessions (
         id TEXT PRIMARY KEY,
@@ -54,6 +79,54 @@ describe("labSessionsStore / sim queue SQLite", () => {
       upsertLabSession({ id: "sess-legacy", sessionType: "optimization", meta: { n: 1 } });
       const rows = listLabSessions(10);
       expect(rows.some((r) => r.id === "sess-legacy")).toBe(true);
+    });
+  });
+
+  it("migrates legacy lab_sessions rows missing optimization progress timing columns", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ip-web-simqueue-"));
+    const dbPath = path.join(root, "legacy-opt-progress.db");
+    const raw = openRawDb(dbPath);
+    raw.exec(`
+      CREATE TABLE lab_sessions (
+        id TEXT PRIMARY KEY,
+        session_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        heartbeat_at TEXT,
+        status_note TEXT,
+        project_id TEXT,
+        meta_json TEXT NOT NULL DEFAULT '{}',
+        best_trial_id TEXT,
+        CHECK (session_type IN ('optimization', 'grid_batch')),
+        CHECK (status IN ('queued', 'running', 'complete', 'cancelled', 'interrupted'))
+      );
+    `);
+    const t = new Date().toISOString();
+    raw
+      .prepare(
+        `INSERT INTO lab_sessions (
+          id, session_type, status, created_at, updated_at, heartbeat_at, status_note, project_id, meta_json, best_trial_id
+        ) VALUES (?, 'optimization', 'running', ?, ?, ?, NULL, NULL, '{}', NULL)`,
+      )
+      .run("sess-legacy-opt", t, t, t);
+    raw.close();
+
+    await withFreshQueueDb(dbPath, async () => {
+      const { getLabSession, patchOptimizationEvalProgress } = await import("./labSessionsStore");
+      patchOptimizationEvalProgress("sess-legacy-opt", {
+        currentGeneration: 1,
+        currentEvaluationIndex: 7,
+        currentEvaluationStartedAt: "2026-01-01T00:00:10.000Z",
+        lastEvaluationDurationMs: 1234,
+        lastEvaluationFinishedAt: "2026-01-01T00:00:11.234Z",
+      });
+      const row = getLabSession("sess-legacy-opt");
+      expect(row?.opt_current_generation).toBe(1);
+      expect(row?.opt_current_evaluation_index).toBe(7);
+      expect(row?.opt_current_evaluation_started_at).toBe("2026-01-01T00:00:10.000Z");
+      expect(row?.opt_last_evaluation_duration_ms).toBe(1234);
+      expect(row?.opt_last_evaluation_finished_at).toBe("2026-01-01T00:00:11.234Z");
     });
   });
 
@@ -164,6 +237,74 @@ describe("labSessionsStore / sim queue SQLite", () => {
     });
   });
 
+  it("does not collide lab_trials.id across sessions for same evaluation index", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ip-web-simqueue-"));
+    const dbPath = path.join(root, "trial-id-collisions.db");
+    await withFreshQueueDb(dbPath, async () => {
+      const { listLabTrials, upsertLabSession, upsertLabTrial } = await import("./labSessionsStore");
+
+      upsertLabSession({ id: "sess-a", sessionType: "optimization", status: "running", meta: {} });
+      upsertLabSession({ id: "sess-b", sessionType: "optimization", status: "running", meta: {} });
+
+      // Same evaluation index in two different sessions must not hit the PK uniqueness on lab_trials.id.
+      upsertLabTrial({
+        sessionId: "sess-a",
+        trialId: makeOptimizationTrialId({ sessionId: "sess-a", evaluationNumber: 0 }),
+        generation: 0,
+        evaluationIndex: 0,
+        assignmentsJson: "{}",
+        metricValue: 0.1,
+        mse: 1,
+        isNewBest: false,
+        runSummaryJson: "{}",
+      });
+      upsertLabTrial({
+        sessionId: "sess-b",
+        trialId: makeOptimizationTrialId({ sessionId: "sess-b", evaluationNumber: 0 }),
+        generation: 0,
+        evaluationIndex: 0,
+        assignmentsJson: "{}",
+        metricValue: 0.2,
+        mse: 1,
+        isNewBest: false,
+        runSummaryJson: "{}",
+      });
+
+      expect(listLabTrials("sess-a").length).toBe(1);
+      expect(listLabTrials("sess-b").length).toBe(1);
+      expect(listLabTrials("sess-a")[0]!.id).not.toEqual(listLabTrials("sess-b")[0]!.id);
+    });
+  });
+
+  it("marks non-best optimization trials previewable when fullRunJson is persisted", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ip-web-simqueue-"));
+    const dbPath = path.join(root, "opt-preview-payload.db");
+    await withFreshQueueDb(dbPath, async () => {
+      const { getLabTrial, upsertLabSession, upsertLabTrial } = await import("./labSessionsStore");
+      const { toOptimizationTrialSummary } = await import("./optimizationTrialSummary");
+
+      upsertLabSession({ id: "sess-prev", sessionType: "optimization", status: "complete", meta: {} });
+      upsertLabTrial({
+        sessionId: "sess-prev",
+        trialId: "trial-nonbest",
+        generation: 0,
+        evaluationIndex: 2,
+        assignmentsJson: "{}",
+        metricValue: 0.5,
+        mse: 0.1,
+        isNewBest: false,
+        runSummaryJson: JSON.stringify({ tickCount: 1, seed: 99 }),
+        fullRunJson: JSON.stringify({
+          manifest: { schemaVersion: 1, seed: 99 },
+          history: [{ metrics: { tick: 0, giniWealth: 0 } }],
+        }),
+      });
+      const row = getLabTrial("sess-prev", "trial-nonbest");
+      expect(row).toBeDefined();
+      expect(toOptimizationTrialSummary(row!).has_run_payload).toBe(true);
+    });
+  });
+
   it("claims queued optimization sessions in FIFO order", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "ip-web-simqueue-"));
     const dbPath = path.join(root, "opt-claim.db");
@@ -202,7 +343,7 @@ describe("labSessionsStore / sim queue SQLite", () => {
   it("marks stale running sessions as interrupted during startup recovery", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "ip-web-simqueue-"));
     const dbPath = path.join(root, "stale-sessions.db");
-    const raw = new Database(dbPath);
+    const raw = openRawDb(dbPath);
     raw.exec(`
       CREATE TABLE lab_sessions (
         id TEXT PRIMARY KEY,

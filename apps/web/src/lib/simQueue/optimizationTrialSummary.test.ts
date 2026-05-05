@@ -42,4 +42,29 @@ describe("toOptimizationTrialSummary", () => {
     const summary = toOptimizationTrialSummary(sampleTrial({ spillover_path: "lab-exports/s1/eval-9-full.json" }));
     expect(summary.has_run_payload).toBe(true);
   });
+
+  it("marks payload when summary embeds _fullRun (worker persist shape)", () => {
+    const summary = toOptimizationTrialSummary(
+      sampleTrial({
+        run_summary_json: JSON.stringify({
+          tickCount: 3,
+          seed: 1,
+          _fullRun: { manifest: { schemaVersion: 1 }, history: [{ metrics: { tick: 0 } }] },
+        }),
+      }),
+    );
+    expect(summary.has_run_payload).toBe(true);
+  });
+
+  it("marks payload when summary references spillover via _fullRunRef", () => {
+    const summary = toOptimizationTrialSummary(
+      sampleTrial({
+        run_summary_json: JSON.stringify({
+          tickCount: 3,
+          _fullRunRef: { _storedPath: "lab-exports/s1/eval-9-full.json" },
+        }),
+      }),
+    );
+    expect(summary.has_run_payload).toBe(true);
+  });
 });

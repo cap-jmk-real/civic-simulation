@@ -1,13 +1,13 @@
 import {
+  heuristicPolicy,
   qrePolicy,
-  runSimulationSync,
+  runSimulationCooperative,
   type AgentState,
   type SimConfig,
   type SimulationRun,
   type TickRecord,
   type WorldState,
 } from "@ip-sim/core";
-import { runSimulationHeuristicWasm } from "@/lib/rustHeuristicRun";
 import {
   applyMultipleAxesToCell,
   autoSweepPointsPerAxis,
@@ -133,6 +133,16 @@ export type EvolutionaryEvaluationBeginPayload = {
   assignments: GridAxisAssignment[];
 };
 
+/** Tick progress inside one evaluation — same cooperative engine as queue `runSimulationCooperative` runs. */
+export type EvolutionarySimulationTickPayload = {
+  generation: number;
+  evaluationNumber: number;
+  /** 1-based tick index within this simulation (matches queue job progress notes). */
+  tick: number;
+  ticks: number;
+  pct: number;
+};
+
 export type EvolutionarySearchParams = {
   baseConfig: SimConfig;
   mode: "heuristic" | "qre" | "llm";
@@ -161,6 +171,8 @@ export type EvolutionarySearchParams = {
   onEvaluation?: (payload: EvolutionaryEvaluationPayload) => void;
   /** Fires before each simulation awaits (one active run at a time). */
   onEvaluationBegin?: (payload: EvolutionaryEvaluationBeginPayload) => void;
+  /** Fires during each evaluation on the same stride as queue jobs (`ticks / 40`, plus tick 0). */
+  onEvaluationSimulationTick?: (payload: EvolutionarySimulationTickPayload) => void;
   onGeneration?: (payload: {
     generation: number;
     bestMse: number;
@@ -229,6 +241,12 @@ function seedPopulationFromResume(
   return pop;
 }
 
+type EvaluateFitnessOpts = {
+  shouldCancel?: () => boolean;
+  yieldToUi?: () => Promise<void>;
+  onSimulationTick?: (info: { tick: number; ticks: number; pct: number }) => void;
+};
+
 async function evaluateFitness(
   genes: number[],
   axisIds: readonly GridAxisId[],
@@ -239,6 +257,7 @@ async function evaluateFitness(
   target: number,
   objective: OptimizationObjective,
   maxAgentsCap: number | null | undefined,
+  opts?: EvaluateFitnessOpts,
 ): Promise<{ mse: number; run: SimulationRun & { finalWorld?: WorldState } }> {
   const assignments = genesToAssignments(genes, axisIds, base);
   /** Baseline manifest follows optimize policy; axis overrides (e.g. `ui.policyMode`) can still patch it. */
@@ -261,23 +280,43 @@ async function evaluateFitness(
     };
   }
 
-  let run: SimulationRun & { finalWorld?: WorldState };
-  if (manifest.policyMode === "qre") {
-    run = runSimulationSync({
-      config: cfg,
-      manifest: {
-        policyMode: "qre",
-        qreTemperature: manifest.qreTemperature,
-      },
-      decide: (world: WorldState, agent: AgentState) =>
-        qrePolicy(agent, world, {
-          temperature: manifest.qreTemperature,
-          seedSalt: cfg.seed,
-        }),
-    }) as SimulationRun & { finalWorld?: WorldState };
-  } else {
-    run = await runSimulationHeuristicWasm(cfg);
-  }
+  const baseDecide =
+    manifest.policyMode === "qre"
+      ? (world: WorldState, agent: AgentState) =>
+          qrePolicy(agent, world, {
+            temperature: manifest.qreTemperature,
+            seedSalt: cfg.seed,
+          })
+      : (_world: WorldState, agent: AgentState) => heuristicPolicy(agent, _world);
+
+  let lastReportedTick = Number.NaN;
+  const progressStride = Math.max(1, Math.floor(cfg.ticks / 40) || 1);
+  const tickYieldInterval = Math.max(1, Math.floor(cfg.ticks / 20) || 1);
+
+  const decide = (w: WorldState, agent: AgentState) => {
+    if (opts?.onSimulationTick && w.tick !== lastReportedTick) {
+      lastReportedTick = w.tick;
+      if (w.tick % progressStride === 0 || w.tick === 0) {
+        const at = Math.min(w.tick + 1, cfg.ticks);
+        const pct = cfg.ticks > 0 ? (100 * at) / cfg.ticks : 100;
+        opts.onSimulationTick({ tick: at, ticks: cfg.ticks, pct });
+      }
+    }
+    return baseDecide(w, agent);
+  };
+
+  const run = (await runSimulationCooperative({
+    config: cfg,
+    manifest: {
+      policyMode: manifest.policyMode,
+      qreTemperature: manifest.qreTemperature,
+      seed: cfg.seed,
+    },
+    decide,
+    tickYieldInterval,
+    shouldCancel: opts?.shouldCancel,
+    yieldToUi: opts?.yieldToUi ?? (async () => {}),
+  })) as SimulationRun & { finalWorld?: WorldState };
 
   const last = run.history[run.history.length - 1];
   if (!last) return { mse: Number.POSITIVE_INFINITY, run };
@@ -313,6 +352,7 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
     shouldCancel,
     onEvaluation,
     onEvaluationBegin,
+    onEvaluationSimulationTick,
     onGeneration,
     resumeFromBestGenes,
     evaluationNumberOffset = 0,
@@ -391,6 +431,18 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
         target,
         objective,
         maxAgentsCap,
+        {
+          shouldCancel,
+          yieldToUi,
+          onSimulationTick: onEvaluationSimulationTick
+            ? (info) =>
+                onEvaluationSimulationTick({
+                  generation: generation + generationDisplayOffset,
+                  evaluationNumber: evaluationNumberOffset + evaluations + 1,
+                  ...info,
+                })
+            : undefined,
+        },
       );
       evaluations++;
       const isNewBest = mse < bestEver.mse;
@@ -476,6 +528,18 @@ export async function runEvolutionarySearch(params: EvolutionarySearchParams): P
       target,
       objective,
       maxAgentsCap,
+      {
+        shouldCancel,
+        yieldToUi,
+        onSimulationTick: onEvaluationSimulationTick
+          ? (info) =>
+              onEvaluationSimulationTick({
+                generation: genIdx + generationDisplayOffset,
+                evaluationNumber: evaluationNumberOffset + evaluations + 1,
+                ...info,
+              })
+          : undefined,
+      },
     );
     evaluations++;
     bestEver.run = fallback.run;

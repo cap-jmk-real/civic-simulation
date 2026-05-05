@@ -949,9 +949,18 @@ export function SimulationLab() {
         parsed.data.sessions.map((s) => {
           const existing = prev.find((p) => p.id === s.id);
           return {
-            ...s,
+            id: s.id,
+            sessionType: s.sessionType,
+            status: s.status,
+            // Preserve the original creation timestamp so elapsed time remains anchored
+            // even as updatedAt advances with new progress.
+            createdAt: existing?.createdAt,
+            updatedAt: s.updatedAt,
+            trialCount: s.trialCount,
+            cellCount: s.cellCount,
+            // Keep any previously hydrated meta; SSE payload does not carry it.
             meta: existing?.meta,
-          };
+          } satisfies LabSessionHydrationSummary;
         }),
       );
     };

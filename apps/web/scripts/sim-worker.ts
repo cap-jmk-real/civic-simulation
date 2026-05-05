@@ -42,14 +42,42 @@ import {
   type OptimizationObjective,
   type OptimizationPolicyMode,
 } from "../src/lib/evolutionaryOptimize";
-import { buildCompactRunSummaryJson, optionalFullRunJsonUnderCap } from "../src/lib/labPersistenceClient";
+import { buildCompactRunSummaryJson } from "../src/lib/labPersistenceClient";
+import { fullRunJsonForLabTrialPersist } from "../src/lib/simQueue/labTrialFullRunPersist";
 import type { GridAxisId } from "../src/lib/gridAxes";
 import { readWorkerRuntimeConfig, WorkerRuntime } from "../src/lib/simQueue/workerRuntime";
+import { buildOptimizationLogEvent } from "../src/lib/simQueue/optimizationLogging";
+import { makeOptimizationTrialId } from "../src/lib/simQueue/optimizationIds";
 
 function sleep(ms: number) {
   return new Promise<void>((r) => setTimeout(r, ms));
 }
 const logger = createBackendLogger("sim-worker");
+
+/** Wall-clock ETA from average duration of finished evaluations (session-level, not per-tick inside one sim). */
+function formatEtaMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  const s = Math.ceil(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function logOptimizationProgressLine(payload: Record<string, unknown>) {
+  console.info("[sim-worker] optimization progress", payload);
+  logger.info("Optimization progress", payload);
+}
+
+/** Interval while a single evaluation (full simulation) is in flight; 0 disables. */
+function parseOptEvalProgressLogIntervalMs(): number {
+  const raw = process.env.SIM_WORKER_OPT_PROGRESS_INTERVAL_MS?.trim();
+  if (raw === "0" || raw === "") return 0;
+  const n = Number.parseInt(raw ?? "", 10);
+  if (!Number.isFinite(n) || n < 0) return 30_000;
+  return n;
+}
 
 type OptimizationSessionMeta = {
   mode?: unknown;
@@ -179,7 +207,12 @@ function isOptimizationPolicyMode(v: unknown): v is OptimizationPolicyMode {
 
 async function runOneOptimizationSession(sessionId: string) {
   const row = getLabSession(sessionId);
-  if (!row) return;
+  if (!row) {
+    const payload = buildOptimizationLogEvent("opt_session_error", { sessionId }, { reason: "row_missing" });
+    console.error("[sim-worker]", payload);
+    logger.error("Optimization session row missing", payload);
+    return;
+  }
   const meta = (JSON.parse(row.meta_json) ?? {}) as OptimizationSessionMeta;
   const axisIds = Array.isArray(meta.axisIds) ? (meta.axisIds.filter((v): v is GridAxisId => typeof v === "string") as GridAxisId[]) : [];
   const metric = isOptimizationMetricKey(meta.metric) ? meta.metric : null;
@@ -194,13 +227,40 @@ async function runOneOptimizationSession(sessionId: string) {
   const baseConfig = meta.baseConfig as Parameters<typeof mergeSimConfig>[0] | undefined;
   if (!baseConfig || !mode || !policyMode || !metric || !objective || axisIds.length === 0 || populationSize < 1 || generations < 1) {
     completeLabSession(sessionId, "cancelled");
-    logger.error("Optimization session meta invalid", { sessionId });
+    const payload = buildOptimizationLogEvent("opt_session_terminal", { sessionId }, { status: "cancelled", reason: "invalid_meta" });
+    console.error("[sim-worker]", payload);
+    logger.error("Optimization session meta invalid", payload);
     return;
   }
 
   let bestTrialId: string | null = null;
   const segPlanned = populationSize * generations;
   heartbeatLabSession(sessionId, `running optimization 0/${segPlanned}`);
+  const sessionStartPayload = buildOptimizationLogEvent("opt_session_start", { sessionId }, {
+    sessionType: row.session_type,
+    populationSize,
+    generations,
+    metric,
+    objective,
+    mode,
+    policyMode,
+  });
+  console.info("[sim-worker]", sessionStartPayload);
+  logger.info("Optimization session start", sessionStartPayload);
+  const evaluationStartTimes = new Map<number, number>();
+  const sessionWallStartMs = Date.now();
+  const evaluationNumberOffset =
+    typeof meta.evaluationNumberOffset === "number" ? Math.max(0, Math.floor(meta.evaluationNumberOffset)) : 0;
+  const evalProgressEveryMs = parseOptEvalProgressLogIntervalMs();
+  let lastSimTickLogAt = 0;
+  let evalRunningInterval: ReturnType<typeof setInterval> | null = null;
+  const clearEvalRunningLog = () => {
+    if (evalRunningInterval) {
+      clearInterval(evalRunningInterval);
+      evalRunningInterval = null;
+    }
+  };
+
   try {
     const out = await runEvolutionarySearch({
       baseConfig: mergeSimConfig(baseConfig),
@@ -215,18 +275,89 @@ async function runOneOptimizationSession(sessionId: string) {
       populationSize,
       generations,
       mutationRate,
-      evaluationNumberOffset:
-        typeof meta.evaluationNumberOffset === "number" ? Math.max(0, Math.floor(meta.evaluationNumberOffset)) : 0,
+      evaluationNumberOffset,
       generationDisplayOffset:
         typeof meta.generationDisplayOffset === "number" ? Math.max(0, Math.floor(meta.generationDisplayOffset)) : 0,
+      onEvaluationBegin: (begin) => {
+        clearEvalRunningLog();
+        lastSimTickLogAt = 0;
+        const { generation, evaluationNumber } = begin;
+        const now = Date.now();
+        evaluationStartTimes.set(evaluationNumber, now);
+        const completedBefore = Math.max(0, evaluationNumber - evaluationNumberOffset - 1);
+        const pctSession = segPlanned > 0 ? Number(((100 * completedBefore) / segPlanned).toFixed(1)) : 0;
+        let etaRemainingMs: number | null = null;
+        let etaRemaining = "—";
+        if (completedBefore > 0) {
+          const elapsed = now - sessionWallStartMs;
+          const avgMs = elapsed / completedBefore;
+          const remaining = segPlanned - completedBefore;
+          etaRemainingMs = avgMs * remaining;
+          etaRemaining = formatEtaMs(etaRemainingMs);
+        }
+        logOptimizationProgressLine({
+          sessionId,
+          phase: "eval_begin",
+          generation,
+          evaluationNumber,
+          completedEvaluations: completedBefore,
+          totalEvaluations: segPlanned,
+          pctSession,
+          etaRemaining,
+          etaRemainingMs,
+          note: "evaluation simulation starting (same engine as queue jobs; tick % logged below)",
+        });
+        const payload = buildOptimizationLogEvent("opt_session_evaluation_begin", { sessionId }, {
+          generation,
+          evaluationNumber,
+          axisIds,
+        });
+        console.info("[sim-worker]", payload);
+        logger.info("Optimization evaluation begin", payload);
+
+        if (evalProgressEveryMs > 0) {
+          const evalStartedAt = Date.now();
+          evalRunningInterval = setInterval(() => {
+            const evalElapsedMs = Date.now() - evalStartedAt;
+            logOptimizationProgressLine({
+              sessionId,
+              phase: "eval_still_running",
+              generation,
+              evaluationNumber,
+              completedEvaluations: completedBefore,
+              totalEvaluations: segPlanned,
+              pctSession,
+              currentEvalElapsedMs: evalElapsedMs,
+              currentEvalElapsed: formatEtaMs(evalElapsedMs),
+              note: "simulation still running for this evaluation",
+            });
+          }, evalProgressEveryMs);
+        }
+      },
       shouldCancel: () => {
         const current = getLabSession(sessionId);
         return !current || current.status === "cancelled";
       },
+      onEvaluationSimulationTick: (info) => {
+        const now = Date.now();
+        if (now - lastSimTickLogAt < 5000 && info.tick < info.ticks) return;
+        lastSimTickLogAt = now;
+        logOptimizationProgressLine({
+          sessionId,
+          phase: "eval_sim_tick",
+          generation: info.generation,
+          evaluationNumber: info.evaluationNumber,
+          tick: info.tick,
+          ticks: info.ticks,
+          pctTicks: Number(info.pct.toFixed(1)),
+          note: `eval ${info.evaluationNumber} sim ${info.tick}/${info.ticks} (${info.pct.toFixed(1)}%)`,
+        });
+      },
       onEvaluation: (ev: EvolutionaryEvaluationPayload) => {
-        const trialId = `opt_e_${ev.evaluationNumber}_${mergeSimConfig(baseConfig).seed}`;
+        clearEvalRunningLog();
+        const trialId = makeOptimizationTrialId({ sessionId, evaluationNumber: ev.evaluationNumber });
         const runSummaryJson = buildCompactRunSummaryJson(ev.run);
-        const fullRunJson = ev.isNewBest ? optionalFullRunJsonUnderCap(ev.run) : null;
+        const fullRunJson = fullRunJsonForLabTrialPersist(ev.run);
         upsertLabTrial({
           sessionId,
           trialId,
@@ -240,6 +371,54 @@ async function runOneOptimizationSession(sessionId: string) {
           fullRunJson,
         });
         if (ev.isNewBest) bestTrialId = trialId;
+        const startedAt = evaluationStartTimes.get(ev.evaluationNumber);
+        const elapsedMs = startedAt != null ? Date.now() - startedAt : undefined;
+        const completed = Math.max(0, ev.evaluationNumber - evaluationNumberOffset);
+        const pctSession = segPlanned > 0 ? Number(((100 * completed) / segPlanned).toFixed(1)) : 100;
+        let etaRemainingMs: number | null = null;
+        let etaRemaining = "—";
+        if (completed >= segPlanned) {
+          etaRemaining = "0s";
+          etaRemainingMs = 0;
+        } else if (completed > 0) {
+          const elapsed = Date.now() - sessionWallStartMs;
+          const avgMs = elapsed / completed;
+          const remaining = segPlanned - completed;
+          etaRemainingMs = avgMs * remaining;
+          etaRemaining = formatEtaMs(etaRemainingMs);
+        }
+        logOptimizationProgressLine({
+          sessionId,
+          phase: "eval_done",
+          generation: ev.generation,
+          evaluationNumber: ev.evaluationNumber,
+          completedEvaluations: completed,
+          totalEvaluations: segPlanned,
+          pctSession,
+          etaRemaining,
+          etaRemainingMs,
+          lastEvalDurationMs: elapsedMs ?? null,
+          lastEvalDuration: elapsedMs != null ? formatEtaMs(elapsedMs) : null,
+        });
+        const evalPayload = buildOptimizationLogEvent("opt_session_evaluation_end", { sessionId }, {
+          generation: ev.generation,
+          evaluationNumber: ev.evaluationNumber,
+          mse: ev.mse,
+          metricValue: ev.metricValue,
+          isNewBest: ev.isNewBest,
+          elapsedMs,
+        });
+        console.info("[sim-worker]", evalPayload);
+        logger.info("Optimization evaluation end", evalPayload);
+
+        const trialPayload = buildOptimizationLogEvent("opt_session_trial_persisted", { sessionId }, {
+          trialId,
+          generation: ev.generation,
+          evaluationNumber: ev.evaluationNumber,
+          isNewBest: ev.isNewBest,
+        });
+        console.info("[sim-worker]", trialPayload);
+        logger.info("Optimization trial persisted", trialPayload);
       },
       onGeneration: (gen) => {
         heartbeatLabSession(sessionId, `running optimization ${gen.evaluations}/${segPlanned}`);
@@ -248,6 +427,12 @@ async function runOneOptimizationSession(sessionId: string) {
     const current = getLabSession(sessionId);
     if (!current || current.status === "cancelled" || out.cancelled) {
       completeLabSession(sessionId, "cancelled");
+      const payload = buildOptimizationLogEvent("opt_session_terminal", { sessionId }, {
+        status: "cancelled",
+        reason: !current ? "row_missing_after_run" : out.cancelled ? "cancelled_flag" : "cancelled_status",
+      });
+      console.info("[sim-worker]", payload);
+      logger.info("Optimization session cancelled", payload);
       return;
     }
     const progress = getOptimizationTrialProgress(sessionId);
@@ -259,9 +444,31 @@ async function runOneOptimizationSession(sessionId: string) {
         (metricLast ? ` · metric ${readOptimizationMetric(metricLast, metric).toPrecision(4)}` : ""),
     );
     completeLabSession(sessionId, "complete", bestTrialId);
+    const payload = buildOptimizationLogEvent("opt_session_terminal", { sessionId }, {
+      status: "complete",
+      bestTrialId,
+      evaluations: out.evaluations,
+      generationsCompleted: out.generationsCompleted,
+    });
+    console.info("[sim-worker]", payload);
+    logger.info("Optimization session complete", payload);
   } catch (e) {
-    logger.error("Optimization session failed", { sessionId, error: e instanceof Error ? e.message : String(e) });
+    const err = e instanceof Error ? e : new Error(String(e));
+    const errorPayload = buildOptimizationLogEvent("opt_session_error", { sessionId }, {
+      error: err.message,
+      stack: err.stack,
+    });
+    console.error("[sim-worker]", errorPayload);
+    logger.error("Optimization session failed", errorPayload);
     completeLabSession(sessionId, "cancelled");
+    const terminalPayload = buildOptimizationLogEvent("opt_session_terminal", { sessionId }, {
+      status: "cancelled",
+      reason: "error",
+    });
+    console.info("[sim-worker]", terminalPayload);
+    logger.warn("Optimization session cancelled after error", terminalPayload);
+  } finally {
+    clearEvalRunningLog();
   }
 }
 

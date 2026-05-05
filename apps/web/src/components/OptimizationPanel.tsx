@@ -3,6 +3,7 @@
 import { type SimConfig } from "@ip-sim/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ParamHelp } from "@/components/ParamHelp";
+import { formatLabEvalEventType, formatWorkerMetricValue } from "@/lib/simQueue/optimizationLogging";
 import {
   formatAxisCellValue,
   getGridAxisDefinition,
@@ -36,7 +37,6 @@ import {
   readActiveLabJob,
   setActiveLabJob,
   subscribeLabJobs,
-  type LabJobOptimizationProgress,
 } from "@/lib/labJobStore";
 import {
   persistLabSessionCreate,
@@ -48,6 +48,8 @@ import {
   deriveBestOptimizationOverviewRowId,
   deriveHydratedOptimizationOverviewRows,
   deriveHydratedOptimizationLiveProgress,
+  deriveOptimizationEvalTimingDisplay,
+  deriveOptimizationSessionStartMs,
   deriveOptimizationTrialRunsCountText,
   deriveOptimizationVisibleTrialRows,
   formatOptimizationDurationMs,
@@ -59,11 +61,12 @@ import {
   shouldRefreshHydratedOverview,
   type OptimizationOverviewSortDirection,
   type OptimizationOverviewSortKey,
+  type OptimizationEvalTimingSnapshot,
   type OptimizationProgressSnapshot,
   type PersistedOptimizationTrial,
 } from "@/lib/simQueue/optimizationLiveProgress";
 
-const DEFAULT_OPT_AXES: GridAxisId[] = ["policy.enforcementIntensity", "policy.openScienceSubsidy"];
+const DEFAULT_OPT_AXES: GridAxisId[] = GRID_AXIS_DEFINITIONS.map((d) => d.id).filter((id) => id !== "seed");
 
 /** Soft cap for GA population size input; hard cap is max eval budget (and absolute grid ceiling). */
 const OPT_GA_MAX_POPULATION = 256;
@@ -116,6 +119,13 @@ function formatFinishedAt(ts: string): string {
   return new Date(n).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+function formatEventTs(ts: string | null | undefined): string {
+  if (!ts) return "—";
+  const n = Date.parse(ts);
+  if (!Number.isFinite(n)) return "—";
+  return new Date(n).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
 export function OptimizationPanel(props: {
   baseConfig: SimConfig;
   mode: "heuristic" | "qre" | "llm";
@@ -137,9 +147,9 @@ export function OptimizationPanel(props: {
   const initialPolicyMode: OptimizationPolicyMode = props.mode === "qre" ? "qre" : "heuristic";
   const [selectedAxes, setSelectedAxes] = useState<Set<GridAxisId>>(() => new Set(DEFAULT_OPT_AXES));
   const [policyMode, setPolicyMode] = useState<OptimizationPolicyMode>(initialPolicyMode);
-  const [metric, setMetric] = useState<OptimizationMetricKey>("innovationFlowPerAgent");
-  const [objective, setObjective] = useState<OptimizationObjective>("target");
-  const [targetStr, setTargetStr] = useState("0.05");
+  const [metric, setMetric] = useState<OptimizationMetricKey>("meanWealth");
+  const [objective, setObjective] = useState<OptimizationObjective>("maximize");
+  const [targetStr, setTargetStr] = useState("");
   const [populationSize, setPopulationSize] = useState(12);
   const [generations, setGenerations] = useState(15);
   const [mutationRate, setMutationRate] = useState(0.12);
@@ -157,13 +167,11 @@ export function OptimizationPanel(props: {
   /** Gene vector length from last finished optimization (for resume eligibility vs axis count). */
   const [resumeGeneCount, setResumeGeneCount] = useState<number | null>(null);
 
-  const [plannedTotalAgentsStr, setPlannedTotalAgentsStr] = useState(() =>
-    String(totalAgents(props.baseConfig.agentCounts)),
-  );
+  const [plannedTotalAgentsStr, setPlannedTotalAgentsStr] = useState("1000");
   const [maxAgentsInput, setMaxAgentsInput] = useState("");
   const [maxEvalBudgetInput, setMaxEvalBudgetInput] = useState(() => String(GRID_ABS_MAX_RUNS));
   /** Empty = use Run sidebar ticks (`baseConfig.ticks`). */
-  const [optTicksStr, setOptTicksStr] = useState("");
+  const [optTicksStr, setOptTicksStr] = useState("500");
 
   const [running, setRunning] = useState(false);
   const activeLabJobIdRef = useRef<string | null>(null);
@@ -201,6 +209,7 @@ export function OptimizationPanel(props: {
   const [lastWallMs, setLastWallMs] = useState<number | null>(null);
   const [, labJobUiBump] = useState(0);
   const [hydratedSnapshot, setHydratedSnapshot] = useState<OptimizationProgressSnapshot | null>(null);
+  const [hydratedEvalTiming, setHydratedEvalTiming] = useState<OptimizationEvalTimingSnapshot | null>(null);
   const [hydratedOverviewRows, setHydratedOverviewRows] = useState<
     ReturnType<typeof deriveHydratedOptimizationOverviewRows>
   >([]);
@@ -218,9 +227,30 @@ export function OptimizationPanel(props: {
   const lastOverviewSnapshotRef = useRef<OptimizationProgressSnapshot | null>(null);
   const hydratedOverviewFetchInFlightRef = useRef(false);
 
+  const [workerLogOpen, setWorkerLogOpen] = useState(false);
+  const [workerLogEvents, setWorkerLogEvents] = useState<
+    Array<{
+      id: string;
+      type: string;
+      generation: number | null;
+      evaluationIndex: number | null;
+      ts: string;
+      elapsedMs: number | null;
+      metricValue: number | null;
+      mse: number | null;
+      isNewBest: boolean;
+      detail: unknown;
+    }>
+  >([]);
+  const [workerLogError, setWorkerLogError] = useState<string | null>(null);
+  const workerLogFetchInFlightRef = useRef(false);
+  const workerLogAbortRef = useRef<AbortController | null>(null);
+
   const optimizationRunStartMsRef = useRef<number | null>(null);
   const currentEvalStartMsRef = useRef<number | null>(null);
   const optimizeStartWarnedRef = useRef(false);
+  const hydratedSessionStartMsRef = useRef<{ sessionId: string; startMs: number } | null>(null);
+  const [, clockTick] = useState(0);
 
   const activeBackendSession =
     props.activeOptimizationSession &&
@@ -291,6 +321,7 @@ export function OptimizationPanel(props: {
   useEffect(() => {
     if (!hasHydratedRunningSession) {
       setHydratedSnapshot(null);
+      setHydratedEvalTiming(null);
       return;
     }
     const sessionId = props.activeOptimizationSession?.id;
@@ -304,15 +335,32 @@ export function OptimizationPanel(props: {
         if (!res.ok) return;
         const json = (await res.json()) as {
           progress?: { evaluationIndex?: number; generation?: number; trialCount?: number } | null;
+          evalTiming?: {
+            currentGeneration?: number | null;
+            currentEvaluationIndex?: number | null;
+            currentEvaluationStartedAt?: string | null;
+            lastEvaluationDurationMs?: number | null;
+            lastEvaluationFinishedAt?: string | null;
+          };
         };
         const p = json.progress;
-        if (!alive || !p) return;
-        if (typeof p.evaluationIndex !== "number" || typeof p.generation !== "number") return;
-        setHydratedSnapshot({
-          evaluationIndex: p.evaluationIndex,
-          generation: p.generation,
-          trialCount: typeof p.trialCount === "number" ? p.trialCount : p.evaluationIndex,
-        });
+        if (!alive) return;
+        if (p && typeof p.evaluationIndex === "number" && typeof p.generation === "number") {
+          setHydratedSnapshot({
+            evaluationIndex: p.evaluationIndex,
+            generation: p.generation,
+            trialCount: typeof p.trialCount === "number" ? p.trialCount : p.evaluationIndex,
+          });
+        }
+        if (json.evalTiming) {
+          setHydratedEvalTiming({
+            currentGeneration: json.evalTiming.currentGeneration ?? null,
+            currentEvaluationIndex: json.evalTiming.currentEvaluationIndex ?? null,
+            currentEvaluationStartedAt: json.evalTiming.currentEvaluationStartedAt ?? null,
+            lastEvaluationDurationMs: json.evalTiming.lastEvaluationDurationMs ?? null,
+            lastEvaluationFinishedAt: json.evalTiming.lastEvaluationFinishedAt ?? null,
+          });
+        }
       } catch {
         /* keep stale snapshot on transient errors */
       }
@@ -336,6 +384,7 @@ export function OptimizationPanel(props: {
       lastOverviewFetchAtMsRef.current = null;
       lastOverviewSnapshotRef.current = null;
       hydratedOverviewFetchInFlightRef.current = false;
+      hydratedSessionStartMsRef.current = null;
       return;
     }
     const sessionId = props.activeOptimizationSession?.id;
@@ -639,7 +688,10 @@ export function OptimizationPanel(props: {
           `/api/lab/sessions/${encodeURIComponent(sessionId)}/trials/${encodeURIComponent(trialId)}`,
           { cache: "no-store" },
         );
-        if (!res.ok) return;
+        if (!res.ok) {
+          console.warn("[OptimizationPanel] trial preview fetch failed", { sessionId, trialId, status: res.status });
+          return;
+        }
         const json = (await res.json()) as {
           trial?: {
             id: string;
@@ -649,7 +701,10 @@ export function OptimizationPanel(props: {
             fullRunJson: string | null;
           };
         };
-        if (!json.trial?.fullRunJson) return;
+        if (!json.trial?.fullRunJson) {
+          console.warn("[OptimizationPanel] trial has no resolvable full run for preview", { sessionId, trialId });
+          return;
+        }
         const run = reviveStoredSingleRun(json.trial.fullRunJson);
         const cell: GridCellResult = {
           id: `hydrated_${json.trial.id}`,
@@ -733,21 +788,93 @@ export function OptimizationPanel(props: {
     plannedGridN < 1 ||
     (objective === "target" && !Number.isFinite(target));
 
-  const localHydratedProgress: LabJobOptimizationProgress | null = (() => {
-    const active = readActiveLabJob();
-    if (!active || active.type !== "optimization") return null;
-    if (!isOptimizationProgress(active.progress)) return null;
-    if (props.activeOptimizationSession?.id && active.id !== props.activeOptimizationSession.id) return null;
-    return active.progress;
-  })();
+  useEffect(() => {
+    if (!hasHydratedRunningSession) {
+      hydratedSessionStartMsRef.current = null;
+      return;
+    }
+    const s = props.activeOptimizationSession;
+    if (!s?.id) return;
+    const cached = hydratedSessionStartMsRef.current;
+    if (cached?.sessionId === s.id) return;
+    const observedAtMs = Date.now();
+    hydratedSessionStartMsRef.current = {
+      sessionId: s.id,
+      startMs: deriveOptimizationSessionStartMs({ session: s, observedAtMs }),
+    };
+  }, [hasHydratedRunningSession, props.activeOptimizationSession]);
+
+  useEffect(() => {
+    if (!running && !hasHydratedRunningSession) return;
+    const t = window.setInterval(() => clockTick((n) => n + 1), 1_000);
+    return () => window.clearInterval(t);
+  }, [hasHydratedRunningSession, running]);
+
+  const workerLogSessionId = activeBackendSession?.id ?? (running ? activeLabJobIdRef.current : null);
+  const shouldPollWorkerLog =
+    workerLogOpen &&
+    !!workerLogSessionId &&
+    (running || props.activeOptimizationSession?.status === "running");
+
+  useEffect(() => {
+    if (!workerLogOpen) {
+      setWorkerLogError(null);
+      return;
+    }
+    if (!workerLogSessionId) return;
+    let alive = true;
+    const refresh = async () => {
+      if (workerLogFetchInFlightRef.current) return;
+      workerLogFetchInFlightRef.current = true;
+      setWorkerLogError(null);
+      workerLogAbortRef.current?.abort();
+      const controller = new AbortController();
+      workerLogAbortRef.current = controller;
+      try {
+        const res = await fetch(`/api/lab/sessions/${encodeURIComponent(workerLogSessionId)}/events`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const j = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(j.error ?? res.statusText);
+        }
+        const json = (await res.json()) as { events?: unknown };
+        const events = Array.isArray(json.events) ? (json.events as typeof workerLogEvents) : [];
+        if (!alive) return;
+        // Keep the UI bounded even if API returns more.
+        setWorkerLogEvents(events.slice(0, 50));
+      } catch (e) {
+        if (!alive) return;
+        if (e instanceof DOMException && e.name === "AbortError") return;
+        setWorkerLogError(e instanceof Error ? e.message : String(e));
+      } finally {
+        workerLogFetchInFlightRef.current = false;
+      }
+    };
+
+    void refresh();
+    if (!shouldPollWorkerLog) return () => {
+      alive = false;
+      workerLogAbortRef.current?.abort();
+    };
+    const t = window.setInterval(() => void refresh(), 5_000);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+      workerLogAbortRef.current?.abort();
+    };
+  }, [shouldPollWorkerLog, workerLogOpen, workerLogSessionId]);
 
   const hydratedLive =
     hasHydratedRunningSession && props.activeOptimizationSession
       ? deriveHydratedOptimizationLiveProgress({
           session: props.activeOptimizationSession,
           snapshot: hydratedSnapshot,
-          localProgress: localHydratedProgress,
           nowMs: Date.now(),
+          sessionStartMs: hydratedSessionStartMsRef.current?.sessionId === props.activeOptimizationSession.id
+            ? hydratedSessionStartMsRef.current.startMs
+            : null,
         })
       : null;
 
@@ -814,6 +941,10 @@ export function OptimizationPanel(props: {
     lastPersistedTrialAt: derivedLastTrialAt,
     nowMs: Date.now(),
     staleThresholdMs: 30_000,
+  });
+  const hydratedTimingDisplay = deriveOptimizationEvalTimingDisplay({
+    timing: hydratedEvalTiming,
+    nowMs: Date.now(),
   });
 
   const toggleOverviewSort = (key: OptimizationOverviewSortKey) => {
@@ -1294,6 +1425,16 @@ export function OptimizationPanel(props: {
                 <span className="text-[var(--muted)]">Preparing next evaluation…</span>
               )}
             </p>
+            {hydratedLive ? (
+              <div className="space-y-0.5 text-[10px] text-sky-100/80">
+                {hydratedTimingDisplay.currentEvaluationLine ? (
+                  <p className="tabular-nums">{hydratedTimingDisplay.currentEvaluationLine}</p>
+                ) : null}
+                {hydratedTimingDisplay.lastEvaluationLine ? (
+                  <p className="tabular-nums">{hydratedTimingDisplay.lastEvaluationLine}</p>
+                ) : null}
+              </div>
+            ) : null}
             <div className="space-y-1">
               <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-[var(--muted)]">
                 <span>Segment evaluations</span>
@@ -1324,6 +1465,9 @@ export function OptimizationPanel(props: {
                   {!running && hydratedLive?.throughputPerSec != null
                     ? ` · ${hydratedLive.throughputPerSec.toFixed(2)} eval/s`
                     : ""}
+                </span>
+                <span>
+                  Source: <span className="text-[var(--text)]">DB-backed session snapshot</span>
                 </span>
                 <span>
                   Elapsed:{" "}
@@ -1363,6 +1507,8 @@ export function OptimizationPanel(props: {
                   <span className="text-[var(--text)]">
                     {waitingDiagnostics.phase === "evaluating"
                       ? "evaluating"
+                      : waitingDiagnostics.phase === "starting"
+                        ? "starting"
                       : waitingDiagnostics.phase === "waiting_to_persist"
                         ? "waiting to persist"
                         : "idle"}
@@ -1376,6 +1522,81 @@ export function OptimizationPanel(props: {
                 </p>
               ) : null}
             </div>
+
+            <details
+              className="rounded border border-sky-900/35 bg-[#0a0f18] px-2 py-1.5"
+              onToggle={(e) => setWorkerLogOpen((e.currentTarget as HTMLDetailsElement).open)}
+            >
+              <summary className="cursor-pointer list-none text-[10px] font-semibold uppercase tracking-wide text-sky-100/80 [&::-webkit-details-marker]:hidden">
+                Worker log
+                <span className="ml-1 font-normal normal-case text-sky-100/70">
+                  {workerLogSessionId ? `· ${workerLogSessionId.slice(0, 8)}…` : ""}
+                  {shouldPollWorkerLog ? " · live" : ""}
+                </span>
+              </summary>
+              <div className="mt-1 space-y-1">
+                <p className="text-[10px] leading-snug text-sky-100/70">
+                  Latest 50 worker events (polled every 5s while running). Collapsed state does not fetch.
+                </p>
+                {workerLogError ? (
+                  <p className="rounded border border-red-900/60 bg-red-950/30 px-2 py-1 text-[10px] text-red-100">
+                    Failed to load events: {workerLogError}
+                  </p>
+                ) : null}
+                <div className="max-h-[min(24vh,220px)] overflow-auto rounded border border-sky-900/35">
+                  <table className="w-max min-w-full border-collapse text-left font-mono-n text-[10px]">
+                    <thead className="sticky top-0 z-[5] bg-[#101824] text-sky-100/75 shadow-[0_1px_0_rgba(0,0,0,0.35)]">
+                      <tr className="border-b border-sky-900/35">
+                        <th className="p-1.5 text-right">ts</th>
+                        <th className="p-1.5">type</th>
+                        <th className="p-1.5 text-right">gen</th>
+                        <th className="p-1.5 text-right">eval</th>
+                        <th className="p-1.5 text-right">elapsed</th>
+                        <th className="p-1.5 text-right">metric</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {workerLogEvents.length === 0 ? (
+                        <tr className="border-t border-sky-900/35">
+                          <td className="p-2 text-sky-100/70" colSpan={6}>
+                            {workerLogSessionId ? "No events yet." : "No active session."}
+                          </td>
+                        </tr>
+                      ) : (
+                        workerLogEvents.map((ev) => {
+                          const t = formatLabEvalEventType(ev.type);
+                          const gen = typeof ev.generation === "number" ? ev.generation + 1 : null;
+                          const evalIdx = typeof ev.evaluationIndex === "number" ? ev.evaluationIndex : null;
+                          return (
+                            <tr key={ev.id} className="border-t border-sky-900/25 hover:bg-sky-950/20">
+                              <td className="p-1.5 text-right tabular-nums text-sky-100/70">
+                                {formatEventTs(ev.ts)}
+                              </td>
+                              <td className="p-1.5 text-sky-100/90" title={t.long}>
+                                <span className="inline-flex items-center gap-1">
+                                  <span className="rounded border border-sky-900/35 bg-sky-950/20 px-1 py-0.5 text-[10px] text-sky-100/80">
+                                    {t.short}
+                                  </span>
+                                  <span className="text-sky-100/70">{ev.isNewBest ? "★" : ""}</span>
+                                </span>
+                              </td>
+                              <td className="p-1.5 text-right tabular-nums text-sky-100/80">{gen ?? "—"}</td>
+                              <td className="p-1.5 text-right tabular-nums text-sky-100/80">{evalIdx ?? "—"}</td>
+                              <td className="p-1.5 text-right tabular-nums text-sky-100/70">
+                                {ev.elapsedMs != null ? formatMsClock(ev.elapsedMs) : "—"}
+                              </td>
+                              <td className="p-1.5 text-right tabular-nums text-sky-100/80">
+                                {formatWorkerMetricValue(ev.metricValue)}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </details>
           </div>
         ) : null}
 

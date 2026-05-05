@@ -17,6 +17,11 @@ export type LabSessionRow = {
   project_id: string | null;
   meta_json: string;
   best_trial_id: string | null;
+  opt_current_generation: number | null;
+  opt_current_evaluation_index: number | null;
+  opt_current_evaluation_started_at: string | null;
+  opt_last_evaluation_duration_ms: number | null;
+  opt_last_evaluation_finished_at: string | null;
 };
 
 export type LabTrialRow = {
@@ -44,6 +49,28 @@ export type LabBatchCellRow = {
   run_summary_json: string | null;
   spillover_path: string | null;
   created_at: string;
+};
+
+export type LabEvalEventType =
+  | "opt_session_start"
+  | "opt_eval_begin"
+  | "opt_eval_end"
+  | "opt_trial_persisted"
+  | "opt_session_terminal"
+  | "opt_session_error";
+
+export type LabEvalEventRow = {
+  id: string;
+  session_id: string;
+  event_type: LabEvalEventType;
+  generation: number | null;
+  evaluation_index: number | null;
+  ts: string;
+  elapsed_ms: number | null;
+  metric_value: number | null;
+  mse: number | null;
+  is_new_best: number | null;
+  detail_json: string | null;
 };
 
 function nowIso() {
@@ -181,6 +208,130 @@ export function heartbeatLabSession(id: string, note?: string) {
   db.prepare(`UPDATE lab_sessions SET updated_at = ?, heartbeat_at = ? WHERE id = ? AND status = 'running'`).run(t, t, id);
 }
 
+export type OptimizationEvalProgressPatch = {
+  currentGeneration?: number | null;
+  currentEvaluationIndex?: number | null;
+  currentEvaluationStartedAt?: string | null;
+  lastEvaluationDurationMs?: number | null;
+  lastEvaluationFinishedAt?: string | null;
+  statusNote?: string | null;
+};
+
+/**
+ * Worker-only: persist minimal evaluation timing/progress so the frontend can render
+ * "current evaluation" and "last evaluation" across refreshes.
+ */
+export function patchOptimizationEvalProgress(sessionId: string, patch: OptimizationEvalProgressPatch): void {
+  const db = getQueueDb();
+  const t = nowIso();
+  const sets: string[] = ["updated_at = ?", "heartbeat_at = ?"];
+  const args: unknown[] = [t, t];
+
+  const add = (sql: string, value: unknown) => {
+    sets.push(sql);
+    args.push(value);
+  };
+
+  if (patch.currentGeneration !== undefined) add("opt_current_generation = ?", patch.currentGeneration);
+  if (patch.currentEvaluationIndex !== undefined) add("opt_current_evaluation_index = ?", patch.currentEvaluationIndex);
+  if (patch.currentEvaluationStartedAt !== undefined)
+    add("opt_current_evaluation_started_at = ?", patch.currentEvaluationStartedAt);
+  if (patch.lastEvaluationDurationMs !== undefined)
+    add("opt_last_evaluation_duration_ms = ?", patch.lastEvaluationDurationMs);
+  if (patch.lastEvaluationFinishedAt !== undefined)
+    add("opt_last_evaluation_finished_at = ?", patch.lastEvaluationFinishedAt);
+  if (patch.statusNote !== undefined) add("status_note = ?", patch.statusNote);
+
+  args.push(sessionId);
+  db.prepare(
+    `UPDATE lab_sessions
+     SET ${sets.join(", ")}
+     WHERE id = ? AND status = 'running'`,
+  ).run(...args);
+}
+
+function clampEventType(v: string): LabEvalEventType {
+  // Defensive clamp for DB integrity.
+  switch (v) {
+    case "opt_session_start":
+    case "opt_eval_begin":
+    case "opt_eval_end":
+    case "opt_trial_persisted":
+    case "opt_session_terminal":
+    case "opt_session_error":
+      return v;
+    default:
+      return "opt_session_error";
+  }
+}
+
+/**
+ * Worker-only: append a lightweight optimization evaluation event.
+ * The table is bounded per-session to avoid unbounded growth.
+ */
+export function appendLabEvalEvent(input: {
+  id: string;
+  sessionId: string;
+  eventType: LabEvalEventType;
+  generation?: number | null;
+  evaluationIndex?: number | null;
+  ts?: string;
+  elapsedMs?: number | null;
+  metricValue?: number | null;
+  mse?: number | null;
+  isNewBest?: boolean | null;
+  detail?: unknown;
+  /** Keep at most this many events per session (default 200). */
+  maxEventsPerSession?: number;
+}): void {
+  const db = getQueueDb();
+  const ts = input.ts ?? nowIso();
+  const eventType = clampEventType(input.eventType);
+  const detailJson = input.detail === undefined ? null : JSON.stringify(input.detail);
+  db.prepare(
+    `INSERT INTO lab_eval_events (
+      id, session_id, event_type, generation, evaluation_index, ts, elapsed_ms, metric_value, mse, is_new_best, detail_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.id,
+    input.sessionId,
+    eventType,
+    input.generation ?? null,
+    input.evaluationIndex ?? null,
+    ts,
+    input.elapsedMs ?? null,
+    input.metricValue ?? null,
+    input.mse ?? null,
+    input.isNewBest == null ? null : input.isNewBest ? 1 : 0,
+    detailJson,
+  );
+
+  const maxEvents = input.maxEventsPerSession ?? 200;
+  db.prepare(
+    `DELETE FROM lab_eval_events
+     WHERE session_id = ?
+       AND id NOT IN (
+         SELECT id FROM lab_eval_events
+         WHERE session_id = ?
+         ORDER BY datetime(ts) DESC
+         LIMIT ?
+       )`,
+  ).run(input.sessionId, input.sessionId, maxEvents);
+}
+
+export function listLabEvalEvents(sessionId: string, limit = 200): LabEvalEventRow[] {
+  const db = getQueueDb();
+  return db
+    .prepare(
+      `SELECT id, session_id, event_type, generation, evaluation_index, ts, elapsed_ms, metric_value, mse, is_new_best, detail_json
+       FROM lab_eval_events
+       WHERE session_id = ?
+       ORDER BY datetime(ts) DESC
+       LIMIT ?`,
+    )
+    .all(sessionId, limit) as LabEvalEventRow[];
+}
+
 /** Atomically claim the oldest queued optimization session for backend execution. */
 export function claimNextQueuedOptimizationSession(): string | null {
   const db = getQueueDb();
@@ -236,7 +387,6 @@ export function upsertLabTrial(input: {
       metric_value, mse, elapsed_ms, is_new_best, run_summary_json, spillover_path, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(session_id, evaluation_index) DO UPDATE SET
-      id = excluded.id,
       generation = excluded.generation,
       assignments_json = excluded.assignments_json,
       metric_value = excluded.metric_value,
@@ -312,6 +462,8 @@ export function listLabSessions(limit = 40): LabSessionRow[] {
     .prepare(
       `SELECT id, session_type, status, created_at, updated_at, project_id, meta_json, best_trial_id
        , heartbeat_at, status_note
+       , opt_current_generation, opt_current_evaluation_index, opt_current_evaluation_started_at
+       , opt_last_evaluation_duration_ms, opt_last_evaluation_finished_at
        FROM lab_sessions ORDER BY datetime(updated_at) DESC LIMIT ?`,
     )
     .all(limit) as LabSessionRow[];
@@ -323,6 +475,8 @@ export function getLabSession(id: string): LabSessionRow | undefined {
     .prepare(
       `SELECT id, session_type, status, created_at, updated_at, project_id, meta_json, best_trial_id
        , heartbeat_at, status_note
+       , opt_current_generation, opt_current_evaluation_index, opt_current_evaluation_started_at
+       , opt_last_evaluation_duration_ms, opt_last_evaluation_finished_at
        FROM lab_sessions WHERE id = ?`,
     )
     .get(id) as LabSessionRow | undefined;

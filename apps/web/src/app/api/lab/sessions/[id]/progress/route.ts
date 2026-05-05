@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getLabSession, getOptimizationTrialProgress, heartbeatLabSession } from "@/lib/simQueue/labSessionsStore";
+import { getLabSession, getOptimizationTrialProgress } from "@/lib/simQueue/labSessionsStore";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,9 +12,6 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
     if (!session) return NextResponse.json({ error: "Not found" }, { status: 404 });
     if (session.session_type !== "optimization") {
       return NextResponse.json({ error: "Session is not optimization" }, { status: 400 });
-    }
-    if (session.status === "running") {
-      heartbeatLabSession(id, "heartbeat via progress poll");
     }
     const progress = getOptimizationTrialProgress(id);
     return NextResponse.json({
@@ -31,6 +28,13 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
             trialCount: progress.trial_count,
           }
         : null,
+      evalTiming: {
+        currentGeneration: session.opt_current_generation,
+        currentEvaluationIndex: session.opt_current_evaluation_index,
+        currentEvaluationStartedAt: session.opt_current_evaluation_started_at,
+        lastEvaluationDurationMs: session.opt_last_evaluation_duration_ms,
+        lastEvaluationFinishedAt: session.opt_last_evaluation_finished_at,
+      },
     }, {
       headers: {
         "Cache-Control": "no-store, no-cache, must-revalidate",

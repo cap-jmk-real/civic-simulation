@@ -1,4 +1,3 @@
-import type { LabJobOptimizationProgress } from "@/lib/labJobStore";
 import type { OptimizationMetricKey, OptimizationObjective } from "@/lib/evolutionaryOptimize";
 import type { LabSessionHydrationSummary } from "@/lib/simQueue/activeRunHydration";
 
@@ -67,12 +66,25 @@ export type OptimizationOverviewSortState = {
 };
 
 export type OptimizationWaitingDiagnostics = {
-  phase: "evaluating" | "waiting_to_persist" | "idle";
+  phase: "starting" | "evaluating" | "waiting_to_persist" | "idle";
   lastPersistedTrialAt: string | null;
   sinceLastTrialWriteMs: number | null;
   staleThresholdMs: number;
   showLongWaitNote: boolean;
   message: string;
+};
+
+export type OptimizationEvalTimingSnapshot = {
+  currentGeneration: number | null;
+  currentEvaluationIndex: number | null;
+  currentEvaluationStartedAt: string | null;
+  lastEvaluationDurationMs: number | null;
+  lastEvaluationFinishedAt: string | null;
+};
+
+export type OptimizationEvalTimingDisplay = {
+  currentEvaluationLine: string | null;
+  lastEvaluationLine: string | null;
 };
 
 const OPTIMIZATION_METRIC_KEYS: ReadonlySet<OptimizationMetricKey> = new Set([
@@ -164,32 +176,46 @@ function plannedFromMeta(meta: unknown): number | null {
 export function deriveHydratedOptimizationLiveProgress(input: {
   session: LabSessionHydrationSummary;
   snapshot: OptimizationProgressSnapshot | null;
-  localProgress: LabJobOptimizationProgress | null;
   nowMs: number;
+  sessionStartMs?: number | null;
 }): HydratedOptimizationLiveProgress {
   const evaluations = Math.max(
     0,
     input.snapshot?.evaluationIndex ?? 0,
     input.snapshot?.trialCount ?? 0,
     input.session.trialCount,
-    input.localProgress?.evaluations ?? 0,
   );
   const planned =
     plannedFromMeta(input.session.meta) ??
-    (input.localProgress?.planned != null && input.localProgress.planned > 0
-      ? input.localProgress.planned
-      : null);
-  const generationCandidates = [input.snapshot?.generation, input.localProgress?.generation].filter(
+    null;
+  const generationCandidates = [input.snapshot?.generation].filter(
     (value): value is number => typeof value === "number" && Number.isFinite(value),
   );
   const generation = generationCandidates.length > 0 ? Math.max(...generationCandidates) : null;
 
-  const startedAt = Date.parse(input.session.createdAt ?? input.session.updatedAt);
-  const elapsedMs = Math.max(0, input.nowMs - (Number.isFinite(startedAt) ? startedAt : input.nowMs));
+  const fallbackStartMs = Date.parse(input.session.createdAt ?? input.session.updatedAt);
+  const startMs =
+    typeof input.sessionStartMs === "number" && Number.isFinite(input.sessionStartMs)
+      ? input.sessionStartMs
+      : Number.isFinite(fallbackStartMs)
+        ? fallbackStartMs
+        : input.nowMs;
+  const elapsedMs = Math.max(0, input.nowMs - startMs);
   const throughputPerSec =
     evaluations > 0 && elapsedMs > 0 ? (evaluations / elapsedMs) * 1000 : null;
 
   return { evaluations, planned, generation, elapsedMs, throughputPerSec };
+}
+
+export function deriveOptimizationSessionStartMs(input: {
+  session: LabSessionHydrationSummary;
+  observedAtMs: number;
+}): number {
+  const createdAt = input.session.createdAt ? Date.parse(input.session.createdAt) : Number.NaN;
+  if (Number.isFinite(createdAt)) return createdAt;
+  const updatedAt = input.session.updatedAt ? Date.parse(input.session.updatedAt) : Number.NaN;
+  if (Number.isFinite(updatedAt)) return updatedAt;
+  return input.observedAtMs;
 }
 
 export function deriveHydratedRecentFinishedOptimizationTrials(input: {
@@ -409,6 +435,18 @@ export function deriveOptimizationWaitingDiagnostics(input: {
   const sinceLastTrialWriteMs =
     Number.isFinite(parsedLast) && input.nowMs >= parsedLast ? input.nowMs - parsedLast : null;
 
+  if (input.running && input.lastPersistedTrialAt == null) {
+    return {
+      phase: input.hasCurrentEvaluation ? "evaluating" : "starting",
+      lastPersistedTrialAt: input.lastPersistedTrialAt,
+      sinceLastTrialWriteMs,
+      staleThresholdMs,
+      showLongWaitNote: false,
+      message: input.hasCurrentEvaluation
+        ? "Simulation candidate is currently evaluating."
+        : "Starting optimization; waiting for the first trial result to be persisted.",
+    };
+  }
   if (input.running && input.hasCurrentEvaluation) {
     return {
       phase: "evaluating",
@@ -456,4 +494,49 @@ export function formatOptimizationDurationMs(durationMs: number | null): string 
   const hours = Math.floor(totalSeconds / 3_600);
   const minutes = Math.floor((totalSeconds % 3_600) / 60);
   return `${hours}h ${minutes}m`;
+}
+
+function formatLocalTime(tsIso: string | null): string {
+  if (!tsIso) return "—";
+  const n = Date.parse(tsIso);
+  if (!Number.isFinite(n)) return "—";
+  return new Date(n).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+export function deriveOptimizationEvalTimingDisplay(input: {
+  timing: OptimizationEvalTimingSnapshot | null;
+  nowMs: number;
+}): OptimizationEvalTimingDisplay {
+  const t = input.timing;
+  if (!t) return { currentEvaluationLine: null, lastEvaluationLine: null };
+
+  const startedMs = t.currentEvaluationStartedAt ? Date.parse(t.currentEvaluationStartedAt) : Number.NaN;
+  const runningForMs =
+    Number.isFinite(startedMs) && input.nowMs >= startedMs ? Math.max(0, input.nowMs - startedMs) : null;
+
+  const hasCurrent =
+    t.currentGeneration != null &&
+    t.currentEvaluationIndex != null &&
+    t.currentEvaluationStartedAt != null &&
+    Number.isFinite(startedMs);
+
+  const currentEvaluationLine = hasCurrent
+    ? (() => {
+        const gen = t.currentGeneration as number;
+        const evalIdx = t.currentEvaluationIndex as number;
+        const startedAt = t.currentEvaluationStartedAt as string;
+        return `Current evaluation: Gen ${gen + 1}, Eval ${evalIdx} started at ${formatLocalTime(
+          startedAt,
+        )} (running for ${formatOptimizationDurationMs(runningForMs)})`;
+      })()
+    : null;
+
+  const hasLast = t.lastEvaluationFinishedAt != null && t.lastEvaluationDurationMs != null;
+  const lastEvaluationLine = hasLast
+    ? `Last evaluation: duration ${formatOptimizationDurationMs(t.lastEvaluationDurationMs)} (finished at ${formatLocalTime(
+        t.lastEvaluationFinishedAt,
+      )})`
+    : null;
+
+  return { currentEvaluationLine, lastEvaluationLine };
 }

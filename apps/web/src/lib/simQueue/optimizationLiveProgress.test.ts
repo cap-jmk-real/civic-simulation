@@ -5,7 +5,9 @@ import {
   deriveOptimizationVisibleTrialRows,
   deriveBestOptimizationOverviewRowId,
   deriveSessionOptimizationSettings,
+  deriveOptimizationEvalTimingDisplay,
   deriveOptimizationWaitingDiagnostics,
+  deriveOptimizationSessionStartMs,
   deriveHydratedOptimizationOverviewRows,
   deriveHydratedOptimizationLiveProgress,
   deriveHydratedRecentFinishedOptimizationTrials,
@@ -23,6 +25,7 @@ function makeSession(overrides: Partial<LabSessionHydrationSummary>): LabSession
     id: "session-1",
     sessionType: "optimization",
     status: "running",
+    createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     trialCount: 0,
     cellCount: 0,
@@ -38,7 +41,6 @@ describe("deriveHydratedOptimizationLiveProgress", () => {
         meta: { populationSize: 5, generations: 10 },
       }),
       snapshot: { evaluationIndex: 7, generation: 1, trialCount: 7 },
-      localProgress: null,
       nowMs: Date.parse("2026-01-01T00:00:10.000Z"),
     });
     expect(live.evaluations).toBe(7);
@@ -46,38 +48,105 @@ describe("deriveHydratedOptimizationLiveProgress", () => {
     expect(live.generation).toBe(1);
   });
 
-  it("falls back to local planned progress when meta is missing", () => {
+  it("returns null planned count when meta is missing", () => {
     const live = deriveHydratedOptimizationLiveProgress({
       session: makeSession({ trialCount: 3, meta: {} }),
       snapshot: null,
-      localProgress: { evaluations: 6, planned: 90, generation: 2 },
       nowMs: Date.parse("2026-01-01T00:00:05.000Z"),
     });
-    expect(live.evaluations).toBe(6);
-    expect(live.planned).toBe(90);
-    expect(live.generation).toBe(2);
+    expect(live.evaluations).toBe(3);
+    expect(live.planned).toBeNull();
+    expect(live.generation).toBeNull();
     expect(live.throughputPerSec).not.toBeNull();
   });
 
-  it("prefers newer local generation when snapshot generation lags", () => {
+  it("uses snapshot generation when available", () => {
     const live = deriveHydratedOptimizationLiveProgress({
       session: makeSession({ trialCount: 6, meta: { populationSize: 4, generations: 5 } }),
       snapshot: { evaluationIndex: 6, generation: 1, trialCount: 6 },
-      localProgress: { evaluations: 6, planned: 20, generation: 3 },
       nowMs: Date.parse("2026-01-01T00:00:12.000Z"),
     });
-    expect(live.generation).toBe(3);
+    expect(live.generation).toBe(1);
   });
 
   it("uses snapshot trialCount when evaluation index is stale", () => {
     const live = deriveHydratedOptimizationLiveProgress({
       session: makeSession({ trialCount: 0, meta: { populationSize: 12, generations: 15 } }),
       snapshot: { evaluationIndex: 0, generation: 0, trialCount: 9 },
-      localProgress: null,
       nowMs: Date.parse("2026-01-01T00:00:15.000Z"),
     });
     expect(live.evaluations).toBe(9);
     expect(live.planned).toBe(180);
+  });
+
+  it("anchors elapsedMs to createdAt when available", () => {
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const now = Date.parse("2026-01-01T00:00:20.000Z");
+    const live = deriveHydratedOptimizationLiveProgress({
+      session: makeSession({ createdAt }),
+      snapshot: { evaluationIndex: 5, generation: 0, trialCount: 5 },
+      nowMs: now,
+    });
+    expect(live.elapsedMs).toBe(20_000);
+  });
+
+  it("falls back to updatedAt for elapsedMs when createdAt is missing", () => {
+    const updatedAt = "2026-01-01T00:00:10.000Z";
+    const now = Date.parse("2026-01-01T00:00:40.000Z");
+    const live = deriveHydratedOptimizationLiveProgress({
+      session: makeSession({ createdAt: undefined, updatedAt }),
+      snapshot: { evaluationIndex: 3, generation: 0, trialCount: 3 },
+      nowMs: now,
+    });
+    expect(live.elapsedMs).toBe(30_000);
+  });
+
+  it("keeps elapsedMs monotonic when sessionStartMs is supplied", () => {
+    const startMs = Date.parse("2026-01-01T00:00:05.000Z");
+    const session = makeSession({
+      createdAt: undefined,
+      updatedAt: "2026-01-01T00:00:50.000Z", // deliberately misleading; should be ignored
+      trialCount: 0,
+    });
+    const a = deriveHydratedOptimizationLiveProgress({
+      session,
+      snapshot: { evaluationIndex: 0, generation: 0, trialCount: 0 },
+      nowMs: startMs + 3_000,
+      sessionStartMs: startMs,
+    });
+    const b = deriveHydratedOptimizationLiveProgress({
+      session,
+      snapshot: { evaluationIndex: 0, generation: 0, trialCount: 0 },
+      nowMs: startMs + 7_000,
+      sessionStartMs: startMs,
+    });
+    expect(a.elapsedMs).toBe(3_000);
+    expect(b.elapsedMs).toBe(7_000);
+    expect(b.elapsedMs).toBeGreaterThanOrEqual(a.elapsedMs);
+  });
+});
+
+describe("deriveOptimizationSessionStartMs", () => {
+  it("prefers createdAt, then updatedAt, then observedAtMs", () => {
+    const observedAtMs = Date.parse("2026-01-01T00:02:00.000Z");
+    expect(
+      deriveOptimizationSessionStartMs({
+        session: makeSession({ createdAt: "2026-01-01T00:00:10.000Z", updatedAt: "2026-01-01T00:01:00.000Z" }),
+        observedAtMs,
+      }),
+    ).toBe(Date.parse("2026-01-01T00:00:10.000Z"));
+    expect(
+      deriveOptimizationSessionStartMs({
+        session: makeSession({ createdAt: undefined, updatedAt: "2026-01-01T00:01:00.000Z" }),
+        observedAtMs,
+      }),
+    ).toBe(Date.parse("2026-01-01T00:01:00.000Z"));
+    expect(
+      deriveOptimizationSessionStartMs({
+        session: makeSession({ createdAt: undefined, updatedAt: "not-a-date" }),
+        observedAtMs,
+      }),
+    ).toBe(observedAtMs);
   });
 });
 
@@ -531,9 +600,43 @@ describe("deriveOptimizationWaitingDiagnostics", () => {
       nowMs: Date.parse("2026-01-01T00:00:10.000Z"),
       staleThresholdMs: 30_000,
     });
-    expect(diag.phase).toBe("waiting_to_persist");
+    expect(diag.phase).toBe("starting");
     expect(diag.sinceLastTrialWriteMs).toBeNull();
     expect(diag.showLongWaitNote).toBe(false);
+  });
+});
+
+describe("deriveOptimizationEvalTimingDisplay", () => {
+  it("renders current evaluation with running time", () => {
+    const display = deriveOptimizationEvalTimingDisplay({
+      timing: {
+        currentGeneration: 1,
+        currentEvaluationIndex: 7,
+        currentEvaluationStartedAt: "2026-01-01T00:00:10.000Z",
+        lastEvaluationDurationMs: null,
+        lastEvaluationFinishedAt: null,
+      },
+      nowMs: Date.parse("2026-01-01T00:00:12.500Z"),
+    });
+    expect(display.currentEvaluationLine).toContain("Current evaluation: Gen 2, Eval 7");
+    expect(display.currentEvaluationLine).toContain("running for 2.5s");
+    expect(display.lastEvaluationLine).toBeNull();
+  });
+
+  it("renders last evaluation duration and finish time", () => {
+    const display = deriveOptimizationEvalTimingDisplay({
+      timing: {
+        currentGeneration: null,
+        currentEvaluationIndex: null,
+        currentEvaluationStartedAt: null,
+        lastEvaluationDurationMs: 12_345,
+        lastEvaluationFinishedAt: "2026-01-01T00:00:30.000Z",
+      },
+      nowMs: Date.parse("2026-01-01T00:00:40.000Z"),
+    });
+    expect(display.currentEvaluationLine).toBeNull();
+    expect(display.lastEvaluationLine).toContain("Last evaluation: duration 12.3s");
+    expect(display.lastEvaluationLine).toContain("finished at");
   });
 });
 
