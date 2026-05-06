@@ -16,6 +16,15 @@ const README_PATH = path.join(repoRoot, "README.md");
 const DEFAULT_STYLE = "flat-square";
 const DEFAULT_LABEL_COLOR = "171717"; // near-black, good on dark themes
 
+// Canonical repo identity for badge/link generation.
+// This avoids accidental mismatches if `shieldcn-cli` reports a different fork/owner.
+const CANONICAL_OWNER =
+  process.env.CANONICAL_OWNER ||
+  process.env.GITHUB_OWNER ||
+  // Default for this repo:
+  "cap-jmk-real";
+const CANONICAL_REPO = process.env.CANONICAL_REPO || process.env.GITHUB_REPO || "";
+
 function parseJsonFromCliOutput(stdout) {
   const start = stdout.indexOf("{");
   const end = stdout.lastIndexOf("}");
@@ -124,17 +133,23 @@ async function generateBadgesMarkdown() {
   const nextMajor = coerceVersionMajor(webPkg?.dependencies?.next);
 
   const { owner, repo, badges } = await getRepoMetaViaShieldcnCli();
+  const canonicalOwner = CANONICAL_OWNER || owner || "";
+  const canonicalRepo = CANONICAL_REPO || repo || "";
   const ci = badges.find((b) => b?.id === "github.ci");
   const license = badges.find((b) => b?.id === "github.license");
 
-  const actionsUrl = owner && repo ? `https://github.com/${owner}/${repo}/actions/workflows/ci.yml` : "";
+  const actionsUrl =
+    canonicalOwner && canonicalRepo
+      ? `https://github.com/${canonicalOwner}/${canonicalRepo}/actions/workflows/ci.yml`
+      : "";
   const licenseUrl = "LICENSE";
-  const docsUrl = owner && repo ? `https://${owner}.github.io/${repo}/` : "";
+  const docsUrl =
+    canonicalOwner && canonicalRepo ? `https://${canonicalOwner}.github.io/${canonicalRepo}/` : "";
 
   const ciImg =
     ci?.url
       ? withShieldDefaults(ci.url.replace("https://www.shieldcn.dev", SHIELDCN_BASE))
-      : withShieldDefaults(`${SHIELDCN_BASE}/github/ci/${owner}/${repo}.svg`, {
+      : withShieldDefaults(`${SHIELDCN_BASE}/github/ci/${canonicalOwner}/${canonicalRepo}.svg`, {
           variant: "secondary",
         });
 
@@ -149,7 +164,7 @@ async function generateBadgesMarkdown() {
             color: "22c55e",
           },
         )
-      : withShieldDefaults(`${SHIELDCN_BASE}/github/license/${owner}/${repo}.svg`, {
+      : withShieldDefaults(`${SHIELDCN_BASE}/github/license/${canonicalOwner}/${canonicalRepo}.svg`, {
           variant: "secondary",
           color: "22c55e",
         });
