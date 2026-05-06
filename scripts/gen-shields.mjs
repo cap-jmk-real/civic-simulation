@@ -146,18 +146,18 @@ async function generateBadgesMarkdown() {
           license.url.replace("https://www.shieldcn.dev", SHIELDCN_BASE),
           {
             variant: "secondary",
-            color: "262626",
+            color: "22c55e",
           },
         )
       : withShieldDefaults(`${SHIELDCN_BASE}/github/license/${owner}/${repo}.svg`, {
           variant: "secondary",
-          color: "262626",
+          color: "22c55e",
         });
 
   const parts = [
     mdBadge({
       alt: "CI",
-      img: ciImg,
+      img: withShieldDefaults(ciImg, { color: "2ea44f" }),
       href: actionsUrl,
     }),
     mdBadge({
@@ -222,7 +222,7 @@ async function generateBadgesMarkdown() {
       img: badgeStatic({
         label: "Rust",
         message: "stable",
-        color: "000000",
+        color: "DEA584",
         logo: "rust",
         variant: "secondary",
       }),
