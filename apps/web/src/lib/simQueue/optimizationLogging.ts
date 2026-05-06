@@ -32,9 +32,9 @@ export function buildOptimizationLogEvent(
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
+    ...extra,
     event,
     sessionId: base.sessionId,
-    ...extra,
   };
 }
 

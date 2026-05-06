@@ -167,8 +167,8 @@ export function LabJobBanner(props: LabJobBannerProps) {
         <span className="font-medium">Previous run interrupted</span>
         <span className="text-amber-100/85">
           {" "}
-          · {kind}. Reload stops in-browser work — open the Queue tab for DB-backed progress details, or start again when
-          ready.
+          · {kind}. Reload stops in-browser work — open the {job.type === "grid" ? "Grid" : "Optimize"} tab for DB-backed
+          progress details, or start again when ready.
         </span>
       </span>
       <span className="flex shrink-0 flex-wrap items-center gap-1.5">

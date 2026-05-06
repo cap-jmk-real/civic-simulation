@@ -18,10 +18,18 @@ describe("sim-worker script (TypeScript)", () => {
     () => {
       const webRoot = path.resolve(fileURLToPath(new URL("../../..", import.meta.url)));
       const tscBin = require.resolve("typescript/bin/tsc");
-      execFileSync(process.execPath, [tscBin, "--noEmit", "-p", path.join(webRoot, "tsconfig.json")], {
-        cwd: webRoot,
-        stdio: "pipe",
-      });
+      try {
+        execFileSync(process.execPath, [tscBin, "--noEmit", "-p", path.join(webRoot, "tsconfig.json")], {
+          cwd: webRoot,
+          stdio: "pipe",
+        });
+      } catch (err) {
+        const e = err as { stdout?: unknown; stderr?: unknown; message?: string };
+        const stdout = Buffer.isBuffer(e.stdout) ? e.stdout.toString("utf8") : String(e.stdout ?? "");
+        const stderr = Buffer.isBuffer(e.stderr) ? e.stderr.toString("utf8") : String(e.stderr ?? "");
+        const base = e && typeof e.message === "string" ? e.message : String(err);
+        throw new Error([base, stdout && `\n[tsc stdout]\n${stdout}`, stderr && `\n[tsc stderr]\n${stderr}`].filter(Boolean).join("\n"));
+      }
     },
   );
 });

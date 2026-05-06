@@ -295,12 +295,14 @@ async function evaluateFitness(
 
   const decide = (w: WorldState, agent: AgentState) => {
     if (opts?.onSimulationTick && w.tick !== lastReportedTick) {
-      lastReportedTick = w.tick;
-      if (w.tick % progressStride === 0 || w.tick === 0) {
+      const shouldReportStride = w.tick % progressStride === 0 || w.tick === 0;
+      const shouldReportTerminal = w.tick === cfg.ticks && lastReportedTick !== w.tick;
+      if (shouldReportStride || shouldReportTerminal) {
         const at = Math.min(w.tick + 1, cfg.ticks);
         const pct = cfg.ticks > 0 ? (100 * at) / cfg.ticks : 100;
         opts.onSimulationTick({ tick: at, ticks: cfg.ticks, pct });
       }
+      lastReportedTick = w.tick;
     }
     return baseDecide(w, agent);
   };

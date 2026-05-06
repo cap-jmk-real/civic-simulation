@@ -358,6 +358,8 @@ async function runOneOptimizationSession(sessionId: string) {
         const trialId = makeOptimizationTrialId({ sessionId, evaluationNumber: ev.evaluationNumber });
         const runSummaryJson = buildCompactRunSummaryJson(ev.run);
         const fullRunJson = fullRunJsonForLabTrialPersist(ev.run);
+        const startedAt = evaluationStartTimes.get(ev.evaluationNumber);
+        const elapsedMs = startedAt != null ? Date.now() - startedAt : undefined;
         upsertLabTrial({
           sessionId,
           trialId,
@@ -366,13 +368,12 @@ async function runOneOptimizationSession(sessionId: string) {
           assignmentsJson: JSON.stringify(ev.assignments),
           metricValue: ev.metricValue,
           mse: ev.mse,
+          elapsedMs,
           isNewBest: ev.isNewBest,
           runSummaryJson,
           fullRunJson,
         });
         if (ev.isNewBest) bestTrialId = trialId;
-        const startedAt = evaluationStartTimes.get(ev.evaluationNumber);
-        const elapsedMs = startedAt != null ? Date.now() - startedAt : undefined;
         const completed = Math.max(0, ev.evaluationNumber - evaluationNumberOffset);
         const pctSession = segPlanned > 0 ? Number(((100 * completed) / segPlanned).toFixed(1)) : 100;
         let etaRemainingMs: number | null = null;

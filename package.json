@@ -31,9 +31,13 @@
     "rust:bench": "cargo run --release --example bench_market_150k --manifest-path packages/ip-sim-engine/Cargo.toml",
     "wasm:build": "wasm-pack build packages/ip-sim-wasm --target bundler --out-dir pkg",
     "presim:worker": "pnpm guard:native",
-    "sim:worker": "pnpm --filter web sim:worker"
+    "sim:worker": "pnpm --filter web sim:worker",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
   },
   "devDependencies": {
-    "concurrently": "^9.2.1"
+    "concurrently": "^9.2.1",
+    "vitepress": "^1.6.4"
   }
 }

@@ -313,7 +313,7 @@ export function appendLabEvalEvent(input: {
        AND id NOT IN (
          SELECT id FROM lab_eval_events
          WHERE session_id = ?
-         ORDER BY datetime(ts) DESC
+         ORDER BY ts DESC
          LIMIT ?
        )`,
   ).run(input.sessionId, input.sessionId, maxEvents);
@@ -326,7 +326,7 @@ export function listLabEvalEvents(sessionId: string, limit = 200): LabEvalEventR
       `SELECT id, session_id, event_type, generation, evaluation_index, ts, elapsed_ms, metric_value, mse, is_new_best, detail_json
        FROM lab_eval_events
        WHERE session_id = ?
-       ORDER BY datetime(ts) DESC
+       ORDER BY ts DESC
        LIMIT ?`,
     )
     .all(sessionId, limit) as LabEvalEventRow[];

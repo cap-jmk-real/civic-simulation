@@ -4,22 +4,9 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeOptimizationTrialId } from "./optimizationIds";
+import { describeSqlite, withFreshQueueDb } from "./sqliteTestEnv";
 
 const require = createRequire(import.meta.url);
-
-function hasNativeSqlite(): boolean {
-  try {
-    const mod = require("better-sqlite3") as { default?: unknown } | ((p: string) => unknown);
-    const DatabaseCtor = (mod as { default?: unknown }).default ?? mod;
-    const db = new (DatabaseCtor as new (p: string) => { close: () => void })(":memory:");
-    db.close();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const describeSqlite = hasNativeSqlite() ? describe : describe.skip;
 
 function openRawDb(dbPath: string) {
   const mod = require("better-sqlite3") as { default?: unknown } | ((p: string) => unknown);
@@ -27,19 +14,6 @@ function openRawDb(dbPath: string) {
   return new (DatabaseCtor as new (p: string) => { exec: (s: string) => void; prepare: (s: string) => { run: (...args: unknown[]) => void }; close: () => void })(
     dbPath,
   );
-}
-
-async function withFreshQueueDb(dbPath: string, fn: () => Promise<void>) {
-  process.env.SIM_QUEUE_DB_PATH = dbPath;
-  vi.resetModules();
-  try {
-    await fn();
-  } finally {
-    const { closeQueueDbForTesting } = await import("./store");
-    closeQueueDbForTesting();
-    delete process.env.SIM_QUEUE_DB_PATH;
-    vi.resetModules();
-  }
 }
 
 describeSqlite("labSessionsStore / sim queue SQLite", () => {

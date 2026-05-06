@@ -3,12 +3,12 @@
 import type { AgentState } from "@ip-sim/core";
 import {
   CIVIC_FILL,
+  civicPrimaryPalette,
   ECONOMIC_FILL,
-  useCivicPrimaryPalette,
 } from "@/lib/graphStyle";
 
 export function GraphLegend(props: { agents: AgentState[] }) {
-  const civicPrimary = useCivicPrimaryPalette(props.agents);
+  const civicPrimary = civicPrimaryPalette(props.agents);
 
   return (
     <div className="mt-2 rounded-md border border-[var(--border)] bg-[#0a0a0c] p-3 font-mono-n text-[11px] leading-snug text-[var(--muted)]">

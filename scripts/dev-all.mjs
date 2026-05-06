@@ -13,9 +13,18 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dbPath = path.join(repoRoot, "apps", "web", "data", "sim-queue.db");
 const sharedEnv = { ...process.env, SIM_QUEUE_DB_PATH: dbPath };
+function parseForceColorFlag(raw) {
+  if (raw == null) return null;
+  const t = String(raw).trim().toLowerCase();
+  if (t === "" || t === "0" || t === "false") return false;
+  return true;
+}
+
+const forceColor = parseForceColorFlag(process.env.FORCE_COLOR);
 const useAnsiColor =
   !("NO_COLOR" in process.env) &&
-  Boolean(process.stdout.isTTY || process.stderr.isTTY || process.env.FORCE_COLOR);
+  Boolean(process.stdout.isTTY || process.stderr.isTTY) &&
+  (forceColor !== false);
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -29,12 +38,20 @@ function getPnpmCommand() {
     return {
       command: process.execPath,
       baseArgs: [process.env.npm_execpath],
+      spawnOptions: { shell: false },
     };
   }
 
+  // On Node.js >= 20.13, spawning `pnpm.cmd` with `shell:false` is unreliable on Windows.
+  // Prefer letting the shell resolve the `.cmd` shim.
+  if (process.platform === "win32") {
+    return { command: "pnpm.cmd", baseArgs: [], spawnOptions: { shell: true } };
+  }
+
   return {
-    command: process.platform === "win32" ? "pnpm.cmd" : "pnpm",
+    command: "pnpm",
     baseArgs: [],
+    spawnOptions: { shell: false },
   };
 }
 
@@ -101,7 +118,7 @@ for (const proc of processes) {
     cwd: repoRoot,
     env: sharedEnv,
     stdio: ["inherit", "pipe", "pipe"],
-    shell: false,
+    shell: pnpm.spawnOptions?.shell ?? false,
   });
 
   prefixStream(child.stdout, { label: proc.label, kind: "stdout" });
@@ -115,7 +132,9 @@ for (const proc of processes) {
 
   child.on("exit", (code, signal) => {
     if (signal) {
-      console.error(`${colorize(`[${proc.label}:err]`, ANSI.red)} exited via signal ${signal}`);
+      if (!(shuttingDown && signal === "SIGTERM")) {
+        console.error(`${colorize(`[${proc.label}:err]`, ANSI.red)} exited via signal ${signal}`);
+      }
     } else if (code && code !== 0) {
       console.error(`${colorize(`[${proc.label}:err]`, ANSI.red)} exited with code ${code}`);
       exitCode = code;

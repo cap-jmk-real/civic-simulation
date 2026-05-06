@@ -11,7 +11,14 @@ export function fullRunJsonForLabTrialPersist(run: SimulationRun & { finalWorld?
   }
   try {
     return serializeRun(run);
-  } catch {
+  } catch (err) {
+    const e = err instanceof Error ? err : new Error(String(err));
+    console.error("[labTrialFullRunPersist] serializeRun failed", {
+      error: e.message,
+      stack: e.stack,
+      manifest: (run as unknown as { manifest?: unknown }).manifest ?? null,
+      historyLen: Array.isArray(run.history) ? run.history.length : null,
+    });
     return null;
   }
 }

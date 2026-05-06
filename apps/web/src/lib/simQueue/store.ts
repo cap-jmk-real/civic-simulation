@@ -187,6 +187,7 @@ export function getQueueDb(): Database.Database {
   try {
     ensureSimQueueDataLayout(dbPath);
     const db = new Database(dbPath);
+    db.pragma("foreign_keys = ON");
     db.pragma("journal_mode = WAL");
     initSchema(db);
     dbSingleton = db;

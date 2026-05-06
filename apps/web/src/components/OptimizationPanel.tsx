@@ -126,6 +126,16 @@ function formatEventTs(ts: string | null | undefined): string {
   return new Date(n).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+function LiveClock(props: { intervalMs?: number; children: (nowMs: number) => React.ReactNode }) {
+  const intervalMs = props.intervalMs ?? 1000;
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const t = window.setInterval(() => setNowMs(Date.now()), intervalMs);
+    return () => window.clearInterval(t);
+  }, [intervalMs]);
+  return <>{props.children(nowMs)}</>;
+}
+
 export function OptimizationPanel(props: {
   baseConfig: SimConfig;
   mode: "heuristic" | "qre" | "llm";
@@ -250,7 +260,7 @@ export function OptimizationPanel(props: {
   const currentEvalStartMsRef = useRef<number | null>(null);
   const optimizeStartWarnedRef = useRef(false);
   const hydratedSessionStartMsRef = useRef<{ sessionId: string; startMs: number } | null>(null);
-  const [, clockTick] = useState(0);
+  const lastWorkerLogSessionIdRef = useRef<string | null>(null);
 
   const activeBackendSession =
     props.activeOptimizationSession &&
@@ -804,12 +814,6 @@ export function OptimizationPanel(props: {
     };
   }, [hasHydratedRunningSession, props.activeOptimizationSession]);
 
-  useEffect(() => {
-    if (!running && !hasHydratedRunningSession) return;
-    const t = window.setInterval(() => clockTick((n) => n + 1), 1_000);
-    return () => window.clearInterval(t);
-  }, [hasHydratedRunningSession, running]);
-
   const workerLogSessionId = activeBackendSession?.id ?? (running ? activeLabJobIdRef.current : null);
   const shouldPollWorkerLog =
     workerLogOpen &&
@@ -819,9 +823,17 @@ export function OptimizationPanel(props: {
   useEffect(() => {
     if (!workerLogOpen) {
       setWorkerLogError(null);
+      setWorkerLogEvents([]);
+      lastWorkerLogSessionIdRef.current = null;
+      workerLogAbortRef.current?.abort();
       return;
     }
     if (!workerLogSessionId) return;
+    if (lastWorkerLogSessionIdRef.current !== workerLogSessionId) {
+      setWorkerLogEvents([]);
+      setWorkerLogError(null);
+      lastWorkerLogSessionIdRef.current = workerLogSessionId;
+    }
     let alive = true;
     const refresh = async () => {
       if (workerLogFetchInFlightRef.current) return;
@@ -1472,7 +1484,19 @@ export function OptimizationPanel(props: {
                 <span>
                   Elapsed:{" "}
                   <span className="tabular-nums text-[var(--text)]">
-                    {displayElapsedMs != null ? formatMsClock(displayElapsedMs) : "—"}
+                    <LiveClock>
+                      {(nowMs) => {
+                        const runStart = optimizationRunStartMsRef.current;
+                        if (running && runStart != null) return formatMsClock(nowMs - runStart);
+                        const hydratedStart =
+                          props.activeOptimizationSession &&
+                          hydratedSessionStartMsRef.current?.sessionId === props.activeOptimizationSession.id
+                            ? hydratedSessionStartMsRef.current.startMs
+                            : null;
+                        if (!running && hydratedStart != null) return formatMsClock(nowMs - hydratedStart);
+                        return displayElapsedMs != null ? formatMsClock(displayElapsedMs) : "—";
+                      }}
+                    </LiveClock>
                   </span>
                 </span>
                 {displayEtaMs != null && Number.isFinite(displayEtaMs) ? (
@@ -1485,7 +1509,15 @@ export function OptimizationPanel(props: {
                 {curEvalElapsedMs != null ? (
                   <span>
                     This eval:{" "}
-                    <span className="tabular-nums text-amber-100/90">{formatMsClock(curEvalElapsedMs)}</span>
+                    <span className="tabular-nums text-amber-100/90">
+                      <LiveClock>
+                        {(nowMs) => {
+                          const startedAt = currentEvalStartMsRef.current;
+                          if (running && startedAt != null) return formatMsClock(nowMs - startedAt);
+                          return formatMsClock(curEvalElapsedMs);
+                        }}
+                      </LiveClock>
+                    </span>
                   </span>
                 ) : null}
                 <span>
@@ -1497,9 +1529,17 @@ export function OptimizationPanel(props: {
                 <span>
                   Since last write:{" "}
                   <span className="tabular-nums text-[var(--text)]">
-                    {waitingDiagnostics.sinceLastTrialWriteMs != null
-                      ? formatMsClock(waitingDiagnostics.sinceLastTrialWriteMs)
-                      : "—"}
+                    <LiveClock>
+                      {(nowMs) => {
+                        const persisted = waitingDiagnostics.lastPersistedTrialAt
+                          ? Date.parse(waitingDiagnostics.lastPersistedTrialAt)
+                          : Number.NaN;
+                        const sinceMs = Number.isFinite(persisted) ? Math.max(0, nowMs - persisted) : null;
+                        const fallback = waitingDiagnostics.sinceLastTrialWriteMs ?? null;
+                        const v = sinceMs ?? fallback;
+                        return v != null ? formatMsClock(v) : "—";
+                      }}
+                    </LiveClock>
                   </span>
                 </span>
                 <span>
@@ -1509,9 +1549,9 @@ export function OptimizationPanel(props: {
                       ? "evaluating"
                       : waitingDiagnostics.phase === "starting"
                         ? "starting"
-                      : waitingDiagnostics.phase === "waiting_to_persist"
-                        ? "waiting to persist"
-                        : "idle"}
+                        : waitingDiagnostics.phase === "waiting_to_persist"
+                          ? "waiting to persist"
+                          : "idle"}
                   </span>
                 </span>
               </div>
@@ -1531,7 +1571,16 @@ export function OptimizationPanel(props: {
                 Worker log
                 <span className="ml-1 font-normal normal-case text-sky-100/70">
                   {workerLogSessionId ? `· ${workerLogSessionId.slice(0, 8)}…` : ""}
-                  {shouldPollWorkerLog ? " · live" : ""}
+                  {workerLogSessionId
+                    ? shouldPollWorkerLog
+                      ? " · live"
+                      : props.activeOptimizationSession &&
+                          props.activeOptimizationSession.id === workerLogSessionId &&
+                          props.activeOptimizationSession.status !== "running" &&
+                          props.activeOptimizationSession.status !== "queued"
+                        ? " · final"
+                        : ""
+                    : ""}
                 </span>
               </summary>
               <div className="mt-1 space-y-1">

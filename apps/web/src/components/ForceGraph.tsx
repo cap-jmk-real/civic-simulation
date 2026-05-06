@@ -3,7 +3,7 @@
 import type { AgentState, Edge } from "@ip-sim/core";
 import { computeForceLayout } from "@/lib/graphLayout";
 import { subsampleGraphForLayout } from "@/lib/graphSample";
-import { civicVisualKey, nodeFillAndStroke, useCivicPrimaryPalette } from "@/lib/graphStyle";
+import { civicPrimaryPalette, civicVisualKey, nodeFillAndStroke } from "@/lib/graphStyle";
 import { useMemo, useState, useEffect, useCallback, useRef } from "react";
 
 function agentTitle(a: AgentState, civicPrimary: boolean): string {
@@ -84,7 +84,7 @@ export function ForceGraph(props: {
   );
 
   const civicPrimary = useMemo(
-    () => useCivicPrimaryPalette(sampled.agents),
+    () => civicPrimaryPalette(sampled.agents),
     [sampled.agents],
   );
 
