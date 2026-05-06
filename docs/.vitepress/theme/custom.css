@@ -1,0 +1,75 @@
+:root {
+  /* Mirror apps/web/src/app/globals.css tokens */
+  --abm-bg: #0d0d0f;
+  --abm-panel: #141418;
+  --abm-border: #2a2a32;
+  --abm-muted: #8a8f98;
+  --abm-text: #e8e8ed;
+  --abm-accent: #3b82f6;
+  --abm-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* VitePress theme tokens */
+  --vp-c-bg: var(--abm-bg);
+  --vp-c-bg-alt: #0a0a0c;
+  --vp-c-bg-elv: var(--abm-panel);
+  --vp-c-bg-soft: rgba(20, 20, 24, 0.8);
+
+  --vp-c-border: var(--abm-border);
+  --vp-c-divider: var(--abm-border);
+
+  --vp-c-text-1: var(--abm-text);
+  --vp-c-text-2: rgba(232, 232, 237, 0.78);
+  --vp-c-text-3: rgba(232, 232, 237, 0.62);
+
+  --vp-c-brand-1: var(--abm-accent);
+  --vp-c-brand-2: rgba(59, 130, 246, 0.85);
+  --vp-c-brand-3: rgba(59, 130, 246, 0.55);
+
+  --vp-font-family-base: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --vp-font-family-mono: var(--abm-mono);
+}
+
+html,
+body {
+  background: var(--abm-bg);
+}
+
+.VPNavBar,
+.VPNavBar.has-sidebar {
+  background: rgba(13, 13, 15, 0.72);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--abm-border);
+}
+
+.VPSidebar {
+  background: rgba(13, 13, 15, 0.92);
+  border-right: 1px solid var(--abm-border);
+}
+
+.VPDoc .content-container {
+  max-width: 920px;
+}
+
+.VPDoc a {
+  text-decoration-color: rgba(59, 130, 246, 0.5);
+}
+
+.VPDoc a:hover {
+  text-decoration-color: rgba(59, 130, 246, 0.9);
+}
+
+.VPDoc :not(pre) > code {
+  font-family: var(--abm-mono);
+  font-size: 0.9em;
+  background: rgba(20, 20, 24, 0.85);
+  border: 1px solid rgba(42, 42, 50, 0.9);
+  border-radius: 6px;
+  padding: 0.1em 0.35em;
+}
+
+.VPDoc pre,
+.VPDoc div[class*="language-"] {
+  background: #0c0c10;
+  border: 1px solid rgba(42, 42, 50, 0.9);
+}
+

@@ -9,6 +9,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "pretest": "pnpm env:check",
     "test": "vitest run",
     "pretest:watch": "pnpm env:check",

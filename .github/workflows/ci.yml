@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.14.2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build core (types)
+        run: pnpm --filter @ip-sim/core build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Build wasm package (@ip-sim/wasm)
+        run: pnpm --filter @ip-sim/wasm build
+
+      - name: Build docs
+        run: pnpm docs:build
+        env:
+          BASE_PATH: "/${{ github.event.repository.name }}/"
+
+      - name: Lint (web)
+        run: pnpm --filter web lint
+
+      - name: Typecheck (web)
+        run: pnpm --filter web typecheck
+
+      - name: Tests (web)
+        run: pnpm --filter web test
+
+      - name: Rust tests (ip-sim-engine)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --manifest-path packages/ip-sim-engine/Cargo.toml
+

@@ -120,19 +120,8 @@ export function LabJobBanner(props: LabJobBannerProps) {
         <span className="text-sky-200/85">
           {" "}
           · {kind}
-          {isGridProgress(job.progress) ? (
-            <>
-              {" "}
-              ({job.progress.done.toLocaleString("en-US")}/{job.progress.total.toLocaleString("en-US")} cells)
-            </>
-          ) : isOptimizationProgress(job.progress) ? (
-            <>
-              {" "}
-              ({job.progress.evaluations.toLocaleString("en-US")}/
-              {job.progress.planned.toLocaleString("en-US")} evals
-              {job.progress.generation != null ? ` · gen ${job.progress.generation + 1}` : ""})
-            </>
-          ) : null}
+          {" "}
+          (progress details come from the DB-backed Queue and Optimization views)
         </span>
       </div>
     );
@@ -168,11 +157,6 @@ export function LabJobBanner(props: LabJobBannerProps) {
   if (!localInterrupted || hideLocalBecauseOnDetailTab) return null;
 
   const kind = job.type === "grid" ? "Grid batch" : "Optimization";
-  const progressLine = isGridProgress(job.progress)
-    ? `${job.progress.done.toLocaleString("en-US")} / ${job.progress.total.toLocaleString("en-US")} cells`
-    : isOptimizationProgress(job.progress)
-      ? `${job.progress.evaluations.toLocaleString("en-US")} / ${job.progress.planned.toLocaleString("en-US")} evals`
-      : "—";
 
   return (
     <div
@@ -183,7 +167,8 @@ export function LabJobBanner(props: LabJobBannerProps) {
         <span className="font-medium">Previous run interrupted</span>
         <span className="text-amber-100/85">
           {" "}
-          · {kind} at {progressLine}. Reload stops in-browser work — start again when ready.
+          · {kind}. Reload stops in-browser work — open the {job.type === "grid" ? "Grid" : "Optimize"} tab for DB-backed
+          progress details, or start again when ready.
         </span>
       </span>
       <span className="flex shrink-0 flex-wrap items-center gap-1.5">

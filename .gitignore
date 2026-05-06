@@ -5,8 +5,11 @@ out
 .env
 .env.local
 *.log
+*.tsbuildinfo
 .DS_Store
 remotion/out
+.vitepress/dist
+docs/.vitepress/dist
 # Rust
 packages/ip-sim-engine/target
 packages/ip-sim-wasm/target

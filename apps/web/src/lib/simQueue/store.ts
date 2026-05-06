@@ -98,6 +98,11 @@ function rebuildLabSessionsTableForInterruptedSupport(db: Database.Database) {
   const projectIdExpr = cols.has("project_id") ? "project_id" : "NULL";
   const metaJsonExpr = cols.has("meta_json") ? "meta_json" : "'{}'";
   const bestTrialExpr = cols.has("best_trial_id") ? "best_trial_id" : "NULL";
+  const curGenExpr = cols.has("opt_current_generation") ? "opt_current_generation" : "NULL";
+  const curEvalExpr = cols.has("opt_current_evaluation_index") ? "opt_current_evaluation_index" : "NULL";
+  const curStartedExpr = cols.has("opt_current_evaluation_started_at") ? "opt_current_evaluation_started_at" : "NULL";
+  const lastDurExpr = cols.has("opt_last_evaluation_duration_ms") ? "opt_last_evaluation_duration_ms" : "NULL";
+  const lastFinishedExpr = cols.has("opt_last_evaluation_finished_at") ? "opt_last_evaluation_finished_at" : "NULL";
   db.exec(`
     CREATE TABLE lab_sessions_v2 (
       id TEXT PRIMARY KEY,
@@ -110,14 +115,22 @@ function rebuildLabSessionsTableForInterruptedSupport(db: Database.Database) {
       project_id TEXT,
       meta_json TEXT NOT NULL DEFAULT '{}',
       best_trial_id TEXT,
+      opt_current_generation INTEGER,
+      opt_current_evaluation_index INTEGER,
+      opt_current_evaluation_started_at TEXT,
+      opt_last_evaluation_duration_ms REAL,
+      opt_last_evaluation_finished_at TEXT,
       CHECK (session_type IN ('optimization', 'grid_batch')),
       CHECK (status IN ('queued', 'running', 'complete', 'cancelled', 'interrupted'))
     );
     INSERT INTO lab_sessions_v2 (
-      id, session_type, status, created_at, updated_at, heartbeat_at, status_note, project_id, meta_json, best_trial_id
+      id, session_type, status, created_at, updated_at, heartbeat_at, status_note, project_id, meta_json, best_trial_id,
+      opt_current_generation, opt_current_evaluation_index, opt_current_evaluation_started_at,
+      opt_last_evaluation_duration_ms, opt_last_evaluation_finished_at
     )
     SELECT
-      id, session_type, status, created_at, updated_at, ${heartbeatExpr}, ${statusNoteExpr}, ${projectIdExpr}, ${metaJsonExpr}, ${bestTrialExpr}
+      id, session_type, status, created_at, updated_at, ${heartbeatExpr}, ${statusNoteExpr}, ${projectIdExpr}, ${metaJsonExpr}, ${bestTrialExpr},
+      ${curGenExpr}, ${curEvalExpr}, ${curStartedExpr}, ${lastDurExpr}, ${lastFinishedExpr}
     FROM lab_sessions;
     DROP TABLE lab_sessions;
     ALTER TABLE lab_sessions_v2 RENAME TO lab_sessions;
@@ -143,6 +156,11 @@ function migrateLabSessionsIfNeeded(db: Database.Database) {
   add("best_trial_id", "best_trial_id TEXT");
   add("heartbeat_at", "heartbeat_at TEXT");
   add("status_note", "status_note TEXT");
+  add("opt_current_generation", "opt_current_generation INTEGER");
+  add("opt_current_evaluation_index", "opt_current_evaluation_index INTEGER");
+  add("opt_current_evaluation_started_at", "opt_current_evaluation_started_at TEXT");
+  add("opt_last_evaluation_duration_ms", "opt_last_evaluation_duration_ms REAL");
+  add("opt_last_evaluation_finished_at", "opt_last_evaluation_finished_at TEXT");
 }
 
 function migrateLabTrialsIfNeeded(db: Database.Database) {
@@ -169,6 +187,7 @@ export function getQueueDb(): Database.Database {
   try {
     ensureSimQueueDataLayout(dbPath);
     const db = new Database(dbPath);
+    db.pragma("foreign_keys = ON");
     db.pragma("journal_mode = WAL");
     initSchema(db);
     dbSingleton = db;
@@ -297,6 +316,11 @@ function initSchema(db: Database.Database) {
       project_id TEXT,
       meta_json TEXT NOT NULL DEFAULT '{}',
       best_trial_id TEXT,
+      opt_current_generation INTEGER,
+      opt_current_evaluation_index INTEGER,
+      opt_current_evaluation_started_at TEXT,
+      opt_last_evaluation_duration_ms REAL,
+      opt_last_evaluation_finished_at TEXT,
       CHECK (session_type IN ('optimization', 'grid_batch')),
       CHECK (status IN ('queued', 'running', 'complete', 'cancelled', 'interrupted'))
     );
@@ -334,6 +358,22 @@ function initSchema(db: Database.Database) {
       UNIQUE(session_id, cell_index)
     );
     CREATE INDEX IF NOT EXISTS idx_lab_batch_cells_session ON lab_batch_cells(session_id, cell_index);
+
+    CREATE TABLE IF NOT EXISTS lab_eval_events (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      generation INTEGER,
+      evaluation_index INTEGER,
+      ts TEXT NOT NULL,
+      elapsed_ms REAL,
+      metric_value REAL,
+      mse REAL,
+      is_new_best INTEGER,
+      detail_json TEXT,
+      FOREIGN KEY (session_id) REFERENCES lab_sessions(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_lab_eval_events_session_ts ON lab_eval_events(session_id, ts DESC);
   `);
   migrateJobsTable(db);
   migrateLabSessionsIfNeeded(db);

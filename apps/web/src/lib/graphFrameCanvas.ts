@@ -1,5 +1,5 @@
 import type { AgentState, Edge } from "@ip-sim/core";
-import { nodeFillAndStroke, useCivicPrimaryPalette } from "@/lib/graphStyle";
+import { civicPrimaryPalette, nodeFillAndStroke } from "@/lib/graphStyle";
 
 export function drawGraphFrame(
   ctx: CanvasRenderingContext2D,
@@ -14,7 +14,7 @@ export function drawGraphFrame(
   ctx.fillStyle = "#0a0a0c";
   ctx.fillRect(0, 0, width, height);
 
-  const civicPrimary = useCivicPrimaryPalette(agents);
+  const civicPrimary = civicPrimaryPalette(agents);
 
   for (const e of edges) {
     const pa = positions[e.a];

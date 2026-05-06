@@ -34,7 +34,7 @@ export function civicVisualKey(
 }
 
 /** True when any agent holds a non-default civic office (graph uses civic-first coloring). */
-export function useCivicPrimaryPalette(agents: AgentState[]): boolean {
+export function civicPrimaryPalette(agents: AgentState[]): boolean {
   return agents.some(
     (a) => a.civicRole === "politician" || a.civicRole === "public_servant",
   );
