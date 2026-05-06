@@ -1,16 +1,24 @@
 # Civic simulation (agent-based IP modelling)
 
-[![CI](https://img.shields.io/github/actions/workflow/status/cap-jmk-real/civic-simulation/ci.yml?style=flat-square&label=CI)](https://github.com/cap-jmk-real/civic-simulation/actions/workflows/ci.yml)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-0ea5e9?style=flat-square&logo=readthedocs&logoColor=white)](https://cap-jmk-real.github.io/civic-simulation/)
-[![License](https://img.shields.io/github/license/cap-jmk-real/civic-simulation?style=flat-square)](https://github.com/cap-jmk-real/civic-simulation)
-[![pnpm](https://img.shields.io/badge/pnpm-9.14.2-F69220?style=flat-square&logo=pnpm&logoColor=white)](https://pnpm.io/)
-[![Node](https://img.shields.io/badge/Node-24-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Next.js](https://img.shields.io/badge/Next.js-15-000000?style=flat-square&logo=next.js&logoColor=white)](https://nextjs.org/)
-[![Rust](https://img.shields.io/badge/Rust-stable-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![WASM](https://img.shields.io/badge/WebAssembly-WASM-654FF0?style=flat-square&logo=webassembly&logoColor=white)](https://webassembly.org/)
+<!-- shieldcn-start -->
+[![CI](https://shieldcn.dev/github/ci/cap-jmk-real/civic-simulation.svg?variant=secondary)](https://github.com/cap-jmk-real/civic-simulation/actions/workflows/ci.yml)
+[![Docs](https://shieldcn.dev/badge/docs-GitHub_Pages-0ea5e9.svg?logo=readthedocs&variant=secondary)](https://cap-jmk-real.github.io/civic-simulation/)
+[![License](https://shieldcn.dev/github/license/cap-jmk-real/civic-simulation.svg?variant=ghost)](https://github.com/cap-jmk-real/civic-simulation/blob/main/LICENSE)
+[![pnpm](https://shieldcn.dev/badge/pnpm-9.14.2-F69220.svg?logo=pnpm&variant=branded)](https://pnpm.io/)
+[![Node](https://shieldcn.dev/badge/node-24-339933.svg?logo=node.js&variant=branded)](https://nodejs.org/)
+[![TypeScript](https://shieldcn.dev/badge/TypeScript-5.7-3178C6.svg?logo=typescript&variant=branded)](https://www.typescriptlang.org/)
+[![Next.js](https://shieldcn.dev/badge/Next.js-15-000000.svg?logo=next.js&variant=secondary)](https://nextjs.org/)
+[![Rust](https://shieldcn.dev/badge/Rust-stable-000000.svg?logo=rust&variant=secondary)](https://www.rust-lang.org/)
+[![WASM](https://shieldcn.dev/badge/WebAssembly-WASM-654FF0.svg?logo=webassembly&variant=secondary)](https://webassembly.org/)
+<!-- shieldcn-end -->
 
 Discrete-time agent-based model (ABM) + a web “lab” UI for experimenting with IP/data-sharing regimes, collaboration networks, and distributional outcomes.
+
+To regenerate badges, run:
+
+```bash
+pnpm gen:shields
+```
 
 ## Tech stack
 
