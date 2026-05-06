@@ -13,6 +13,9 @@ const repoRoot = path.resolve(__dirname, "..");
 const SHIELDCN_BASE = "https://shieldcn.dev";
 const README_PATH = path.join(repoRoot, "README.md");
 
+const DEFAULT_STYLE = "flat-square";
+const DEFAULT_LABEL_COLOR = "171717"; // near-black, good on dark themes
+
 function parseJsonFromCliOutput(stdout) {
   const start = stdout.indexOf("{");
   const end = stdout.lastIndexOf("}");
@@ -35,7 +38,15 @@ function coerceVersionMinor(versionRange) {
   return coerceVersionMajor(versionRange);
 }
 
-function badgeStatic({ label, message, color, logo, variant = "branded" }) {
+function badgeStatic({
+  label,
+  message,
+  color,
+  logo,
+  variant = "branded",
+  style = DEFAULT_STYLE,
+  labelColor = DEFAULT_LABEL_COLOR,
+}) {
   const safeLabel = String(label).replace(/-/g, "_");
   const safeMessage = String(message).replace(/-/g, "_");
   const p = `/badge/${encodeURIComponent(safeLabel)}-${encodeURIComponent(
@@ -44,12 +55,33 @@ function badgeStatic({ label, message, color, logo, variant = "branded" }) {
   const qp = new URLSearchParams();
   if (logo) qp.set("logo", logo);
   if (variant) qp.set("variant", variant);
+  if (style) qp.set("style", style);
+  if (labelColor) qp.set("labelColor", labelColor);
   return `${SHIELDCN_BASE}${p}?${qp.toString()}`;
 }
 
 function mdBadge({ alt, img, href }) {
   if (!href) return `![${alt}](${img})`;
   return `[![${alt}](${img})](${href})`;
+}
+
+function withShieldDefaults(rawUrl, extraParams = {}) {
+  if (!rawUrl) return rawUrl;
+
+  const url = new URL(String(rawUrl));
+
+  // Make README badges deterministic + dark-theme-friendly.
+  if (!url.searchParams.has("style")) url.searchParams.set("style", DEFAULT_STYLE);
+  if (!url.searchParams.has("labelColor"))
+    url.searchParams.set("labelColor", DEFAULT_LABEL_COLOR);
+
+  for (const [k, v] of Object.entries(extraParams)) {
+    if (v !== undefined && v !== null && String(v).length > 0) {
+      url.searchParams.set(k, String(v));
+    }
+  }
+
+  return url.toString();
 }
 
 async function readJson(relPath) {
@@ -99,10 +131,33 @@ async function generateBadgesMarkdown() {
   const licenseUrl = "LICENSE";
   const docsUrl = owner && repo ? `https://${owner}.github.io/${repo}/` : "";
 
+  const ciImg =
+    ci?.url
+      ? withShieldDefaults(ci.url.replace("https://www.shieldcn.dev", SHIELDCN_BASE))
+      : withShieldDefaults(`${SHIELDCN_BASE}/github/ci/${owner}/${repo}.svg`, {
+          variant: "secondary",
+        });
+
+  // Root cause: shieldcn's `variant=ghost` renders a white pill in some environments.
+  // Force a dark label + neutral message color for dark-themed READMEs.
+  const licenseImg =
+    license?.url
+      ? withShieldDefaults(
+          license.url.replace("https://www.shieldcn.dev", SHIELDCN_BASE),
+          {
+            variant: "secondary",
+            color: "262626",
+          },
+        )
+      : withShieldDefaults(`${SHIELDCN_BASE}/github/license/${owner}/${repo}.svg`, {
+          variant: "secondary",
+          color: "262626",
+        });
+
   const parts = [
     mdBadge({
       alt: "CI",
-      img: ci?.url ? ci.url.replace("https://www.shieldcn.dev", SHIELDCN_BASE) : `${SHIELDCN_BASE}/github/ci/${owner}/${repo}.svg?variant=secondary`,
+      img: ciImg,
       href: actionsUrl,
     }),
     mdBadge({
@@ -118,7 +173,7 @@ async function generateBadgesMarkdown() {
     }),
     mdBadge({
       alt: "License",
-      img: license?.url ? license.url.replace("https://www.shieldcn.dev", SHIELDCN_BASE) : `${SHIELDCN_BASE}/github/license/${owner}/${repo}.svg?variant=ghost`,
+      img: licenseImg,
       href: licenseUrl,
     }),
     mdBadge({
