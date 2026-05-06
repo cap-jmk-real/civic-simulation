@@ -1,5 +1,6 @@
 {
   "name": "agent-based-ip-modelling",
+  "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@9.14.2",
   "engines": {
@@ -12,6 +13,10 @@
     "setup:native": "node scripts/setup-native-modules.mjs",
     "doctor:native": "node scripts/setup-native-modules.mjs --doctor",
     "guard:native": "node scripts/setup-native-modules.mjs --guard",
+    "version:bump": "node scripts/bump-version.mjs",
+    "version:patch": "node scripts/bump-version.mjs patch",
+    "version:minor": "node scripts/bump-version.mjs minor",
+    "version:major": "node scripts/bump-version.mjs major",
     "gen:shields": "node scripts/gen-shields.mjs --write",
     "build": "pnpm -r build",
     "predev": "pnpm env:check && pnpm guard:native",

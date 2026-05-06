@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.14.2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build docs
+        run: pnpm docs:build
+        env:
+          BASE_PATH: "/${{ github.event.repository.name }}/"
+
+      - name: Add .nojekyll for GitHub Pages
+        run: touch docs/.vitepress/dist/.nojekyll
+
+      - name: Archive docs artifact
+        run: |
+          cd docs/.vitepress/dist
+          zip -r "../../../docs-dist.zip" .
+
+      - name: Release notes from CHANGELOG
+        id: notes
+        run: |
+          NOTES="$(node scripts/release-notes.mjs "${GITHUB_REF_NAME}")"
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.notes.outputs.body }}
+          files: docs-dist.zip
+
