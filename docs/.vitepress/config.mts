@@ -63,7 +63,7 @@ export default defineConfig({
       ],
     },
 
-    socialLinks: [{ icon: "github", link: `https://github.com/cap-jmk-real/${repoName}` }],
+    socialLinks: [{ icon: "github", link: `https://github.com/julianmkleber/${repoName}` }],
   },
 });
 
