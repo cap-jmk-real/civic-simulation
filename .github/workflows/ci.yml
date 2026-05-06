@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, dev]
 
 permissions:
   contents: read
@@ -36,6 +36,17 @@ jobs:
 
       - name: Build core (types)
         run: pnpm --filter @ip-sim/core build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Build wasm package (@ip-sim/wasm)
+        run: pnpm --filter @ip-sim/wasm build
 
       - name: Build docs
         run: pnpm docs:build
