@@ -3,7 +3,7 @@
 <!-- shieldcn-start -->
 [![CI](https://shieldcn.dev/github/ci/cap-jmk-real/civic-simulation.svg?variant=secondary)](https://github.com/cap-jmk-real/civic-simulation/actions/workflows/ci.yml)
 [![Docs](https://shieldcn.dev/badge/docs-GitHub_Pages-0ea5e9.svg?logo=readthedocs&variant=secondary)](https://cap-jmk-real.github.io/civic-simulation/)
-[![License](https://shieldcn.dev/github/license/cap-jmk-real/civic-simulation.svg?variant=ghost)](https://github.com/cap-jmk-real/civic-simulation/blob/main/LICENSE)
+[![License](https://shieldcn.dev/github/license/cap-jmk-real/civic-simulation.svg?variant=ghost)](LICENSE)
 [![pnpm](https://shieldcn.dev/badge/pnpm-9.14.2-F69220.svg?logo=pnpm&variant=branded)](https://pnpm.io/)
 [![Node](https://shieldcn.dev/badge/node-24-339933.svg?logo=node.js&variant=branded)](https://nodejs.org/)
 [![TypeScript](https://shieldcn.dev/badge/TypeScript-5.7-3178C6.svg?logo=typescript&variant=branded)](https://www.typescriptlang.org/)

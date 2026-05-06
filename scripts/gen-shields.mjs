@@ -96,7 +96,7 @@ async function generateBadgesMarkdown() {
   const license = badges.find((b) => b?.id === "github.license");
 
   const actionsUrl = owner && repo ? `https://github.com/${owner}/${repo}/actions/workflows/ci.yml` : "";
-  const licenseUrl = owner && repo ? `https://github.com/${owner}/${repo}/blob/main/LICENSE` : "";
+  const licenseUrl = "LICENSE";
   const docsUrl = owner && repo ? `https://${owner}.github.io/${repo}/` : "";
 
   const parts = [
