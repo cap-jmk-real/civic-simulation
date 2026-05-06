@@ -7,6 +7,7 @@ function normalizeBase(base: string): string {
 }
 
 const repoName = "civic-simulation";
+const repoOwner = process.env.CANONICAL_OWNER ?? "cap-jmk-real";
 const defaultBase =
   process.env.NODE_ENV === "development" ? "/" : `/${repoName}/`;
 const base = normalizeBase(process.env.BASE_PATH ?? defaultBase);
@@ -63,7 +64,7 @@ export default defineConfig({
       ],
     },
 
-    socialLinks: [{ icon: "github", link: `https://github.com/cap-jmk-real/${repoName}` }],
+    socialLinks: [{ icon: "github", link: `https://github.com/${repoOwner}/${repoName}` }],
   },
 });
 

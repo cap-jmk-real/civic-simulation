@@ -1,14 +1,54 @@
 :root {
-  /* Mirror apps/web/src/app/globals.css tokens */
+  /* Brand palette (light mode) */
+  --abm-bg: #ffffff;
+  --abm-panel: #f6f7fb;
+  --abm-border: #e5e7eb;
+  --abm-muted: #6b7280;
+  --abm-text: #111827;
+  --abm-accent: #3b82f6;
+  --abm-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* App surfaces used by a few overrides */
+  --abm-nav-bg: rgba(255, 255, 255, 0.8);
+  --abm-sidebar-bg: rgba(255, 255, 255, 0.92);
+
+  /* VitePress theme tokens (light) */
+  --vp-c-bg: var(--abm-bg);
+  --vp-c-bg-alt: #f3f4f6;
+  --vp-c-bg-elv: var(--abm-panel);
+  --vp-c-bg-soft: rgba(17, 24, 39, 0.04);
+
+  --vp-c-border: var(--abm-border);
+  --vp-c-divider: var(--abm-border);
+
+  --vp-c-text-1: var(--abm-text);
+  --vp-c-text-2: rgba(17, 24, 39, 0.76);
+  --vp-c-text-3: rgba(17, 24, 39, 0.56);
+
+  --vp-c-brand-1: var(--abm-accent);
+  --vp-c-brand-2: rgba(59, 130, 246, 0.88);
+  --vp-c-brand-3: rgba(59, 130, 246, 0.62);
+
+  --vp-code-bg: rgba(17, 24, 39, 0.04);
+  --vp-code-block-bg: #0c0c10;
+
+  --vp-font-family-base: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --vp-font-family-mono: var(--abm-mono);
+}
+
+.dark {
+  /* Brand palette (dark mode) */
   --abm-bg: #0d0d0f;
   --abm-panel: #141418;
   --abm-border: #2a2a32;
   --abm-muted: #8a8f98;
   --abm-text: #e8e8ed;
   --abm-accent: #3b82f6;
-  --abm-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
-  /* VitePress theme tokens */
+  --abm-nav-bg: rgba(13, 13, 15, 0.72);
+  --abm-sidebar-bg: rgba(13, 13, 15, 0.92);
+
+  /* VitePress theme tokens (dark) */
   --vp-c-bg: var(--abm-bg);
   --vp-c-bg-alt: #0a0a0c;
   --vp-c-bg-elv: var(--abm-panel);
@@ -25,25 +65,25 @@
   --vp-c-brand-2: rgba(59, 130, 246, 0.85);
   --vp-c-brand-3: rgba(59, 130, 246, 0.55);
 
-  --vp-font-family-base: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-  --vp-font-family-mono: var(--abm-mono);
+  --vp-code-bg: rgba(20, 20, 24, 0.85);
+  --vp-code-block-bg: #0c0c10;
 }
 
 html,
 body {
-  background: var(--abm-bg);
+  background: var(--vp-c-bg);
 }
 
 .VPNavBar,
 .VPNavBar.has-sidebar {
-  background: rgba(13, 13, 15, 0.72);
+  background: var(--abm-nav-bg);
   backdrop-filter: blur(10px);
-  border-bottom: 1px solid var(--abm-border);
+  border-bottom: 1px solid var(--vp-c-border);
 }
 
 .VPSidebar {
-  background: rgba(13, 13, 15, 0.92);
-  border-right: 1px solid var(--abm-border);
+  background: var(--abm-sidebar-bg);
+  border-right: 1px solid var(--vp-c-border);
 }
 
 .VPDoc .content-container {
@@ -61,15 +101,15 @@ body {
 .VPDoc :not(pre) > code {
   font-family: var(--abm-mono);
   font-size: 0.9em;
-  background: rgba(20, 20, 24, 0.85);
-  border: 1px solid rgba(42, 42, 50, 0.9);
+  background: var(--vp-code-bg);
+  border: 1px solid var(--vp-c-border);
   border-radius: 6px;
   padding: 0.1em 0.35em;
 }
 
 .VPDoc pre,
 .VPDoc div[class*="language-"] {
-  background: #0c0c10;
-  border: 1px solid rgba(42, 42, 50, 0.9);
+  background: var(--vp-code-block-bg);
+  border: 1px solid var(--vp-c-border);
 }
 
